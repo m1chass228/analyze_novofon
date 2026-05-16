@@ -1,0 +1,9 @@
+
+config.py
+calls_analysis.db
+app.log
+
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
