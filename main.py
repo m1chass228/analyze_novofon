@@ -1,7 +1,7 @@
 import sys
 import logging
 from utils.logs import setup_logger
-from watchdog import watchdog
+from src.watchdog import watchdog
 
 # Инициализируем главный логгер для точки входа
 logger = setup_logger("main")

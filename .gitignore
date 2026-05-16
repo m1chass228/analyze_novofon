@@ -2,6 +2,7 @@
 config.py
 calls_analysis.db
 app.log
+service_account.json
 
 __pycache__/
 *.py[cod]

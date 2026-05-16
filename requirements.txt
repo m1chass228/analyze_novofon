@@ -1,2 +1,4 @@
 requests
-google-generativeai
+openpyxl
+tenacity
+json
