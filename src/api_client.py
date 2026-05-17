@@ -82,16 +82,26 @@ def get_calls(hours_back: int = 5):
             if not call_records:
                 continue
 
-            # Если несколько записей — создаём отдельную задачу на каждую
+            # Собираем данные об используемых SIP-линиях из ответа API
+            ext_sip_id = str(call.get("external_pbx_sip_id") or "").strip()
+            ext_sip_name = str(call.get("external_pbx_sip_name") or "").strip()
+            # На случай, если в будущем Новофон добавит стандартные поля internal/sip в этот метод:
+            internal_val = str(call.get("internal") or "").strip()
+            sip_val = str(call.get("sip") or "").strip()
+
             for rec_id in call_records:
                 calls.append({
                     "id": str(call.get("id")),
                     "communication_id": str(call.get("communication_id") or call.get("id")),
                     "record_id": str(rec_id),
                     "start_time": call.get("start_time"),
-                    "duration": call.get("talk_duration"),
+                    "duration": call.get("talk_duration") or 0,
                     "phone": call.get("contact_phone_number"),
-                    "full_record_link": call.get("full_record_file_link")
+                    "full_record_link": call.get("full_record_file_link"),
+                    "internal": internal_val,
+                    "sip": sip_val,
+                    "ext_sip_id": ext_sip_id,
+                    "ext_sip_name": ext_sip_name
                 })
         
         logger.info(f"[API] Fetched {len(calls)} records from {len(data)} calls")
@@ -105,7 +115,7 @@ def get_calls(hours_back: int = 5):
 @retry(
     retry=retry_if_exception_type((requests.exceptions.RequestException, Exception)),
     wait=wait_exponential_jitter(initial=12, max=120),
-    stop=stop_after_attempt(7),
+    stop=stop_after_attempt(15),
     reraise=True
 )
 def analyze_audio(audio_bytes: bytes, call_info: dict):
@@ -139,9 +149,24 @@ def analyze_audio(audio_bytes: bytes, call_info: dict):
             logger.ai_trace(f"RAW: {result_text}...")
 
             try:
-                json.loads(result_text)
-                return result_text
-            except:
+                parsed_json = json.loads(result_text)
+                
+                # Проверяем, не прислал ли GAS ошибку от Gemini внутри JSON
+                if "error" in parsed_json or parsed_json.get("total_score") == 0 and "error" in result_text:
+                    err_msg = parsed_json.get("error", "Unknown Gemini API Error")
+                    logger.error(f"❌ [GEMINI OVERLOAD] API returned error for {c_id}: {err_msg}")
+                    # Кидаем ошибку, чтобы tenacity её поймал и ушел на вторую попытку
+                    raise requests.exceptions.RequestException(f"Gemini 503 Overload: {err_msg}")
+                
+                return result_text  # Если всё чисто, отдаем строку дальше
+                
+            except json.JSONDecodeError:
+                # На случай если GAS вернул вообще не JSON, а строку ошибки
+                if "Error" in result_text or "503" in result_text:
+                    logger.error(f"❌ [GAS ERROR] Raw error response for {c_id}: {result_text}")
+                    raise requests.exceptions.RequestException(f"GAS raw error: {result_text}")
+                
+                logger.error(f"❌ [PARSE ERROR] Failed to decode JSON for {c_id}")
                 return None
         else:
             logger.error(f"| [HTTP {response.status_code}] {response.text[:500]}")

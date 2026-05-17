@@ -1,126 +1,167 @@
 import sqlite3
+import time
 from datetime import datetime
 from utils.logs import setup_logger
 
 logger = setup_logger("database")
 
+DB_NAME = "calls_analysis.db"
+
 
 def init_db():
-    """Инициализация базы данных"""
-    conn = sqlite3.connect("calls_analysis.db")
+    """Инициализация базы данных и создание всех необходимых таблиц"""
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
+    # Таблица звонков
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_calls (
-            call_key            TEXT PRIMARY KEY,     -- составной ключ: call_id_record_id
+            call_key            TEXT PRIMARY KEY,
             call_id             TEXT,
             record_id           TEXT,
             start_time          TEXT,
             duration            INTEGER,
             phone               TEXT,
+            admin_name          TEXT DEFAULT 'Не определен',  -- КОРРЕКЦИЯ
+            clinic_branch       TEXT DEFAULT 'Не определен',  -- КОРРЕКЦИЯ
             analysis_text       TEXT,
-            status              TEXT DEFAULT 'success', -- success / download_failed / analysis_failed
-            processed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            status              TEXT DEFAULT 'success',
+            processed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            record_url          TEXT
         )
     """)
     
-    # Индексы для быстрых поисков
+    # Таблица системных флагов/настроек (для отслеживания 30 дней)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    
+    # Индексы для оптимизации
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_id ON processed_calls(call_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_phone ON processed_calls(phone)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_calls(processed_at)")
     
     conn.commit()
     conn.close()
-    logger.info("[DB] Database initialized with composite key support")
+    logger.info("[DB] Database initialized successfully.")
 
 
 def is_call_processed(call_key: str) -> bool:
-    """Проверяет, обработан ли уже этот звонок + запись"""
+    """Проверяет, обработан ли уже этот звонок"""
     try:
-        conn = sqlite3.connect("calls_analysis.db")
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM processed_calls WHERE call_key = ?", (call_key,))
-        result = cursor.fetchone()
+        row = cursor.fetchone()
         conn.close()
-        return result is not None
+        return row is not None
     except Exception as e:
-        logger.error(f"[DB] Check error: {e}")
-        return False  # на всякий случай пропускаем, чтобы не зацикливаться
+        logger.error(f"[DB] Check failed for {call_key}: {e}")
+        return False
 
 
-def save_analysis_to_db(call_key: str, start_time, duration, phone, 
-                       analysis_text, status: str = "success"):
-    """Сохраняет результат анализа"""
+def save_analysis_to_db(call_key, call_id, record_id, start_time, duration, phone, analysis_text, status, record_url, admin_name="Не определен", clinic_branch="Не определен"):
+    """Сохранение результатов с учетом админа и филиала"""
     try:
-        conn = sqlite3.connect("calls_analysis.db")
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        
-        # Разбиваем call_key обратно на части
-        call_id = call_key.split('_')[0] if '_' in call_key else call_key
-        record_id = call_key.split('_')[1] if '_' in call_key else None
-
         cursor.execute("""
             INSERT OR REPLACE INTO processed_calls 
-            (call_key, call_id, record_id, start_time, duration, phone, analysis_text, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (call_key, call_id, record_id, start_time, duration, phone, admin_name, clinic_branch, analysis_text, status, record_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            call_key,
-            call_id,
-            record_id,
-            start_time,
-            duration,
-            phone,
-            analysis_text,
-            status
+            str(call_key), str(call_id), str(record_id) if record_id else None,
+            str(start_time) if start_time else "", int(duration or 0), str(phone) if phone else "",
+            str(admin_name), str(clinic_branch),
+            str(analysis_text) if analysis_text else None, str(status), str(record_url) if record_url else None
         ))
-        
         conn.commit()
         conn.close()
-        
-        if status == "success":
-            logger.debug(f"[DB] Saved analysis for {call_key}")
-        else:
-            logger.warning(f"[DB] Saved with status '{status}': {call_key}")
-            
     except Exception as e:
         logger.error(f"[DB] Save failed for {call_key}: {e}")
 
 
 def clear_old_data(days: int = 30):
-    """Очистка старых записей"""
+    """Очистка старых записей из лога базы данных"""
     try:
-        conn = sqlite3.connect("calls_analysis.db")
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        
-        cursor.execute(
-            "DELETE FROM processed_calls WHERE processed_at < datetime('now', ?)", 
-            (f'-{days} days',)
-        )
-        
+        cursor.execute("DELETE FROM processed_calls WHERE processed_at < datetime('now', ?)", (f'-{days} days',))
         deleted_count = cursor.rowcount
         conn.commit()
         conn.close()
-        
         if deleted_count > 0:
-            logger.info(f"[DB] Cleanup: removed {deleted_count} old records (> {days} days)")
-            
+            logger.info(f"[DB] Cleaned {deleted_count} old rows from database.")
     except Exception as e:
-        logger.error(f"[DB] Cleanup failed: {e}")
+        logger.error(f"[DB] Failed to clear old records: {e}")
 
 
-def get_stats():
-    """Полезная функция для отладки/дашборда"""
+# =========================================================================
+# ХЕЛПЕРЫ ДЛЯ КОНТРОЛЯ СРОКА ОЧИСТКИ (ФЛАГИ В БД)
+# =========================================================================
+
+def get_or_set_period_start() -> float:
+    """
+    Возвращает timestamp первой записи текущего 30-дневного периода.
+    Если флага нет в БД, значит период только начинается — сохраняет текущее время.
+    """
     try:
-        conn = sqlite3.connect("calls_analysis.db")
+        conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
+        cursor.execute("SELECT value FROM system_settings WHERE key = 'period_start'")
+        row = cursor.fetchone()
         
-        cursor.execute("SELECT COUNT(*) FROM processed_calls")
-        total = cursor.fetchone()[0]
+        if row:
+            conn.close()
+            return float(row[0])
         
-        cursor.execute("SELECT COUNT(*) FROM processed_calls WHERE status = 'success'")
-        success = cursor.fetchone()[0]
-        
+        # Если записи нет — это первый звонок за новый цикл, фиксируем время старта периода
+        now_ts = time.time()
+        cursor.execute("INSERT INTO system_settings (key, value) VALUES ('period_start', ?)", (str(now_ts),))
+        conn.commit()
         conn.close()
-        return {"total": total, "success": success}
-    except:
-        return {"total": 0, "success": 0}
+        logger.info(f"[DB] Started a new 30-day reporting period starting from now.")
+        return now_ts
+    except Exception as e:
+        logger.error(f"[DB] Error in get_or_set_period_start: {e}")
+        return time.time()
+
+
+def reset_period():
+    """Сбрасывает флаг периода из БД (вызывается при уничтожении папки reports)"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM system_settings WHERE key = 'period_start'")
+        conn.commit()
+        conn.close()
+        logger.info("[DB] Reporting period flag reset.")
+    except Exception as e:
+        logger.error(f"[DB] Failed to reset period flag: {e}")
+
+
+# =========================================================================
+# ХЕЛПЕР ДЛЯ ВЫГРУЗКИ ДАННЫХ В МАСТЕР-ОТЧЕТ (ВМЕСТО SQL В ЭКСЕЛЕ)
+# =========================================================================
+
+def get_success_calls_for_master() -> list:
+    """Вытаскивает данные для мастера, включая админа и филиал"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        # Добавили admin_name и clinic_branch в SQL запрос
+        cursor.execute("""
+            SELECT start_time, call_id, duration, admin_name, clinic_branch, analysis_text, record_url 
+            FROM processed_calls 
+            WHERE status = 'success'
+            ORDER BY start_time DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"[DB] Failed to fetch data for master report: {e}")
+        return []

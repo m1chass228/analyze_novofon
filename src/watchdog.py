@@ -1,109 +1,93 @@
 import time
+import os
+import shutil
 from utils.logs import setup_logger
-from src.database import init_db, clear_old_data, is_call_processed, save_analysis_to_db
-from src.api_client import get_calls, get_record, analyze_audio
-from src.excel_maker import create_call_report
+
+# Импортируем ВСЕ хелперы для БД в одном месте
+from src.database import (
+    init_db, clear_old_data,
+    get_or_set_period_start, reset_period, get_success_calls_for_master
+)
+from src.api_client import get_calls
+from src.excel_maker import update_master_report, BASE_REPORTS_DIR
+from src.call import process_single_call
 
 logger = setup_logger("watchdog")
 
-
-def generate_call_key(call: dict) -> str:
-    """Уникальный ключ для звонка + записи"""
-    return f"{call['id']}_{call['record_id']}"
+PERIOD_DAYS = 30
+PERIOD_SECONDS = PERIOD_DAYS * 24 * 3600
+CHECK_WINDOW_FIRST_RUN_HOURS = 4
+CHECK_WINDOW_NORMAL_MINUTES = 20
+SLEEP_BETWEEN_CALLS = 8
+SLEEP_BETWEEN_CYCLES = 180
 
 
 def watchdog():
     init_db()
     logger.info(">>> Watchdog process started. Monitoring Novofon calls...")
 
-    last_cleanup_time = 0
     processed_today = 0
+    is_first_run = True
 
     while True:
         current_time = time.time()
 
-        # Ежедневная очистка старых записей
-        if current_time - last_cleanup_time > 86400:  # 24 часа
-            clear_old_data(days=30)
-            last_cleanup_time = current_time
+        # Проверка 30-дневного периода
+        period_start = get_or_set_period_start()
+        if current_time - period_start > PERIOD_SECONDS:
+            logger.warning("⏳ [GEONOCIDE] Срок периода истек. Начинаем зачистку...")
+            if os.path.exists(BASE_REPORTS_DIR):
+                try:
+                    shutil.rmtree(BASE_REPORTS_DIR)
+                    logger.info("✨ [GEONOCIDE] Папка reports успешно удалена.")
+                except Exception as e:
+                    logger.error(f"✗ [GEONOCIDE] Не удалось удалить папку: {e}")
+            
+            reset_period()
+            clear_old_data(days=PERIOD_DAYS)
             processed_today = 0
 
         try:
-            calls = get_calls(hours_back=4)  # чуть увеличил для надёжности
+            hours_to_check = CHECK_WINDOW_FIRST_RUN_HOURS if is_first_run else (CHECK_WINDOW_NORMAL_MINUTES / 60)
+            
+            if is_first_run:
+                logger.info(f"⏳ Первый запуск. Проверяем за {hours_to_check} часа...")
+            else:
+                logger.debug(f"Проверяем последние {CHECK_WINDOW_NORMAL_MINUTES} минут...")
+
+            calls = get_calls(hours_back=hours_to_check)
+            is_first_run = False  # надёжнее сбрасывать сразу
+
+            calls = list(reversed(calls))  # от старых к новым — оставляем
+
             new_found = 0
+            master_needs_update = False
 
             for call in calls:
-                call_key = generate_call_key(call)
-
-                if is_call_processed(call_key):  # теперь по составному ключу!
-                    continue
-
-                new_found += 1
-                logger.info(f"→ New call detected: {call['id']} | {call['phone']} | "
-                           f"Duration: {call.get('duration')} сек.")
-
-                # Скачиваем аудио
-                audio = get_record(
-                    call['id'], 
-                    call['record_id'], 
-                    call['communication_id']
-                )
-
-                if not audio:
-                    logger.warning(f"✗ Failed to download audio for {call['id']}")
-                    # Всё равно помечаем как обработанный, чтобы не спамить
-                    save_analysis_to_db(
-                        call_key, call['start_time'], call.get('duration'),
-                        call['phone'], None, status="download_failed"
-                    )
-                    continue
-
-                # Анализируем
-                logger.info(f"⚡ Sending to Gemini via GAS: {call['id']}")
-                analysis_json = analyze_audio(audio, call)
-
-                if analysis_json:
-                    # 1. Сохраняем в базу данных
-                    save_analysis_to_db(
-                        call_key=call_key,
-                        start_time=call['start_time'],
-                        duration=call.get('duration'),
-                        phone=call['phone'],
-                        analysis_text=analysis_json,
-                        status="success"  # Упростили, так как мы уже в ветке успеха
-                    )
+                result = process_single_call(call)
+                if result == "processed":
+                    new_found += 1
                     processed_today += 1
-                    
-                    # 2. Генерируем красивый Excel-отчет
-                    path_to_excel = create_call_report(
-                        gemini_json_str=analysis_json, 
-                        call_id=str(call['id']), 
-                        duration_sec=int(call.get('duration') or 0)
-                    )
-                    
-                    if path_to_excel:
-                        logger.info(f"| [EXCEL] Отчет успешно сохранен: {path_to_excel}")
-                    else:
-                        logger.warning(f"| [EXCEL] ⚠ Не удалось собрать Excel для {call['id']}")
+                    master_needs_update = True
+                elif result == "skipped":
+                    continue
+                # "error" — просто продолжаем
 
-                    logger.info(f"✓ Successfully analyzed and saved: {call['id']} "
-                              f"(Total today: {processed_today})")
-                else:
-                    logger.error(f"✗ Analysis failed for {call['id']}")
-
-                # Небольшая пауза между звонками (защита от лимитов)
-                time.sleep(8)
+            if master_needs_update:
+                calls_for_report = get_success_calls_for_master()
+                master_path = update_master_report(calls_for_report)
+                if master_path:
+                    logger.info(f"| [MASTER EXCEL] Сводный отчет обновлён: {master_path}")
 
             if new_found == 0:
-                logger.debug("○ No new calls")
+                logger.debug("○ Новых звонков не найдено")
 
         except Exception as e:
             logger.error(f"[CRITICAL] Watchdog loop crashed: {e}", exc_info=True)
             time.sleep(60)
+            continue
 
-        # Основной sleep
-        time.sleep(180)  # проверяем каждые 3 минуты — хороший баланс
-
+        time.sleep(SLEEP_BETWEEN_CYCLES)
 
 if __name__ == "__main__":
     watchdog()
