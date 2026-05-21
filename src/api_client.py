@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import requests
 import time
 import json
+
 from datetime import datetime, timedelta
 
 from utils.logs import setup_logger
@@ -118,6 +121,12 @@ def get_calls(hours_back: int = 5):
     stop=stop_after_attempt(15),
     reraise=True
 )
+@retry(
+    retry=retry_if_exception_type((requests.exceptions.RequestException, Exception)),
+    wait=wait_exponential_jitter(initial=15, max=180),
+    stop=stop_after_attempt(5),
+    reraise=True
+)
 def analyze_audio(audio_bytes: bytes, call_info: dict):
     c_id = call_info.get('id')
     size_kb = len(audio_bytes) / 1024
@@ -125,7 +134,6 @@ def analyze_audio(audio_bytes: bytes, call_info: dict):
     logger.info(f"+--- ANALYZE START: {c_id} | {size_kb:.1f} KB")
 
     try:
-        # Отправляем как base64 — GAS это жрёт стабильнее
         import base64
         audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
 
@@ -139,39 +147,32 @@ def analyze_audio(audio_bytes: bytes, call_info: dict):
 
         response = requests.post(
             cfg.APPS_SCRIPT_URL,
-            json=payload,           # теперь JSON вместо files
-            timeout=300
+            json=payload,
+            timeout=360   # увеличил
         )
 
         if response.status_code == 200:
             result_text = response.text.strip()
             logger.info(f"| [APPS_SCRIPT] Response OK for {c_id}")
-            logger.ai_trace(f"RAW: {result_text}...")
+
+            # Проверяем, не пришёл ли JSON с ошибкой Gemini
+            if "Gemini API error 503" in result_text or "service is currently unavailable" in result_text:
+                logger.warning(f"| [GEMINI 503] Сервис перегружен для {c_id}, будет retry")
+                raise Exception(f"Gemini 503 Overload: {result_text[:300]}")
 
             try:
-                parsed_json = json.loads(result_text)
-                
-                # Проверяем, не прислал ли GAS ошибку от Gemini внутри JSON
-                if "error" in parsed_json or parsed_json.get("total_score") == 0 and "error" in result_text:
-                    err_msg = parsed_json.get("error", "Unknown Gemini API Error")
-                    logger.error(f"❌ [GEMINI OVERLOAD] API returned error for {c_id}: {err_msg}")
-                    # Кидаем ошибку, чтобы tenacity её поймал и ушел на вторую попытку
-                    raise requests.exceptions.RequestException(f"Gemini 503 Overload: {err_msg}")
-                
-                return result_text  # Если всё чисто, отдаем строку дальше
-                
-            except json.JSONDecodeError:
-                # На случай если GAS вернул вообще не JSON, а строку ошибки
-                if "Error" in result_text or "503" in result_text:
-                    logger.error(f"❌ [GAS ERROR] Raw error response for {c_id}: {result_text}")
-                    raise requests.exceptions.RequestException(f"GAS raw error: {result_text}")
-                
-                logger.error(f"❌ [PARSE ERROR] Failed to decode JSON for {c_id}")
+                json.loads(result_text) 
+                logger.ai_trace(f"RAW: {result_text}...")
+                return result_text
+            except:
+                logger.warning(f"| [JSON] Некорректный JSON от GAS: {result_text[:300]}")
                 return None
         else:
-            logger.error(f"| [HTTP {response.status_code}] {response.text[:500]}")
+            logger.error(f"| [HTTP {response.status_code}] {response.text[:400]}")
+            if response.status_code >= 500:
+                raise Exception(f"Server error {response.status_code}")
             return None
 
     except Exception as e:
         logger.error(f"| [ANALYZER] Error {c_id}: {e}")
-        raise
+        raise 

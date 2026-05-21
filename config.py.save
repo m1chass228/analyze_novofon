@@ -1,0 +1,9 @@
+NOVOFON_TOKEN = "uukdy9xj938pg1d02c82r8vmd6i8sk6v4ftftde7"
+NOVOFON_BASE = "https://my.novofon.ru/system/media/talk/"
+NOVOFON_DATAAPI = "https://dataapi-jsonrpc.novofon.ru/v2.0"
+
+GEMINI_API_KEY = "AIzaSyAC1NEGZ_h91CevzjUK-8mN6zh1RD40gaw"
+MODEL = "gemini-2.5-flash"
+PROMPT = "Проанализируй этот звонок. Сделай краткое резюме и оцени работу менеджера."
+
+GAS_URL

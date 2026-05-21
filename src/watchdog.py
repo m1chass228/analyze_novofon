@@ -11,6 +11,7 @@ from src.database import (
 from src.api_client import get_calls
 from src.excel_maker import update_master_report, BASE_REPORTS_DIR
 from src.call import process_single_call
+from src.sync_manager import YandexFolderSyncer
 
 logger = setup_logger("watchdog")
 
@@ -78,6 +79,13 @@ def watchdog():
                 master_path = update_master_report(calls_for_report)
                 if master_path:
                     logger.info(f"| [MASTER EXCEL] Сводный отчет обновлён: {master_path}")
+                
+                # === ФУЛЛ КОММИТ ПАПКИ REPORTS НА ДИСК ===
+                try:
+                    syncer = YandexFolderSyncer()
+                    syncer.sync_reports()
+                except Exception as sync_err:
+                    logger.error(f"❌ Критический сбой модуля синхронизации: {sync_err}")
 
             if new_found == 0:
                 logger.debug("○ Новых звонков не найдено")

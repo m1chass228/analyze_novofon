@@ -9,11 +9,11 @@ DB_NAME = "calls_analysis.db"
 
 
 def init_db():
-    """Инициализация базы данных и создание всех необходимых таблиц"""
+    """Инициализация базы данных, создание таблиц и автоматическая миграция старых схем"""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # Таблица звонков
+    # 1. Создаем таблицу звонков (если её вообще не было)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_calls (
             call_key            TEXT PRIMARY KEY,
@@ -22,8 +22,8 @@ def init_db():
             start_time          TEXT,
             duration            INTEGER,
             phone               TEXT,
-            admin_name          TEXT DEFAULT 'Не определен',  -- КОРРЕКЦИЯ
-            clinic_branch       TEXT DEFAULT 'Не определен',  -- КОРРЕКЦИЯ
+            admin_name          TEXT DEFAULT 'Не определен',
+            clinic_branch       TEXT DEFAULT 'Не определен',
             analysis_text       TEXT,
             status              TEXT DEFAULT 'success',
             processed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -31,7 +31,27 @@ def init_db():
         )
     """)
     
-    # Таблица системных флагов/настроек (для отслеживания 30 дней)
+    # --- БЛОК АВТО-МИГРАЦИИ ДЛЯ СУЩЕСТВУЮЩЕЙ БД ---
+    # Проверяем, есть ли уже новые колонки в таблице (на случай, если БД создавалась старым кодом)
+    cursor.execute("PRAGMA table_info(processed_calls)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    if "admin_name" not in columns:
+        try:
+            cursor.execute("ALTER TABLE processed_calls ADD COLUMN admin_name TEXT DEFAULT 'Не определен'")
+            logger.info("[DB] Миграция: Добавлена колонка admin_name в существующую БД.")
+        except Exception as e:
+            logger.error(f"[DB] Ошибка добавления колонки admin_name: {e}")
+            
+    if "clinic_branch" not in columns:
+        try:
+            cursor.execute("ALTER TABLE processed_calls ADD COLUMN clinic_branch TEXT DEFAULT 'Не определен'")
+            logger.info("[DB] Миграция: Добавлена колонка clinic_branch в существующую БД.")
+        except Exception as e:
+            logger.error(f"[DB] Ошибка добавления колонки clinic_branch: {e}")
+    # -----------------------------------------------
+
+    # 2. Таблица системных флагов/настроек (для отслеживания 30 дней)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_settings (
             key TEXT PRIMARY KEY,
@@ -64,10 +84,11 @@ def is_call_processed(call_key: str) -> bool:
 
 
 def save_analysis_to_db(call_key, call_id, record_id, start_time, duration, phone, analysis_text, status, record_url, admin_name="Не определен", clinic_branch="Не определен"):
-    """Сохранение результатов с учетом админа и филиала"""
+    """Сохранение результатов с явным указанием admin_name и clinic_branch в запросе"""
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
+        # Вставили колонки admin_name и clinic_branch в структуру INSERT
         cursor.execute("""
             INSERT OR REPLACE INTO processed_calls 
             (call_key, call_id, record_id, start_time, duration, phone, admin_name, clinic_branch, analysis_text, status, record_url)
@@ -75,7 +96,8 @@ def save_analysis_to_db(call_key, call_id, record_id, start_time, duration, phon
         """, (
             str(call_key), str(call_id), str(record_id) if record_id else None,
             str(start_time) if start_time else "", int(duration or 0), str(phone) if phone else "",
-            str(admin_name), str(clinic_branch),
+            str(admin_name) if admin_name else "Не определен", 
+            str(clinic_branch) if clinic_branch else "Не определен",
             str(analysis_text) if analysis_text else None, str(status), str(record_url) if record_url else None
         ))
         conn.commit()
@@ -118,7 +140,6 @@ def get_or_set_period_start() -> float:
             conn.close()
             return float(row[0])
         
-        # Если записи нет — это первый звонок за новый цикл, фиксируем время старта периода
         now_ts = time.time()
         cursor.execute("INSERT INTO system_settings (key, value) VALUES ('period_start', ?)", (str(now_ts),))
         conn.commit()
@@ -144,7 +165,7 @@ def reset_period():
 
 
 # =========================================================================
-# ХЕЛПЕР ДЛЯ ВЫГРУЗКИ ДАННЫХ В МАСТЕР-ОТЧЕТ (ВМЕСТО SQL В ЭКСЕЛЕ)
+# ХЕЛПЕР ДЛЯ ВЫГРУЗКИ ДАННЫХ В МАСТЕР-ОТЧЕТ
 # =========================================================================
 
 def get_success_calls_for_master() -> list:
@@ -152,9 +173,9 @@ def get_success_calls_for_master() -> list:
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        # Добавили admin_name и clinic_branch в SQL запрос
+        # Добавляем phone четвертым по счету аргументом (после duration)
         cursor.execute("""
-            SELECT start_time, call_id, duration, admin_name, clinic_branch, analysis_text, record_url 
+            SELECT start_time, call_id, duration, phone, admin_name, clinic_branch, analysis_text, record_url 
             FROM processed_calls 
             WHERE status = 'success'
             ORDER BY start_time DESC
@@ -163,5 +184,5 @@ def get_success_calls_for_master() -> list:
         conn.close()
         return rows
     except Exception as e:
-        logger.error(f"[DB] Failed to fetch data for master report: {e}")
+        logger.error(f"[DB] Error in get_success_calls_for_master: {e}")
         return []
