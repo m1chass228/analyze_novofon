@@ -24,6 +24,7 @@ def init_db():
             phone               TEXT,
             admin_name          TEXT DEFAULT 'Не определен',
             clinic_branch       TEXT DEFAULT 'Не определен',
+            direction           TEXT DEFAULT 'in', -- Добавили дефолтное значение
             analysis_text       TEXT,
             status              TEXT DEFAULT 'success',
             processed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -32,26 +33,31 @@ def init_db():
     """)
     
     # --- БЛОК АВТО-МИГРАЦИИ ДЛЯ СУЩЕСТВУЮЩЕЙ БД ---
-    # Проверяем, есть ли уже новые колонки в таблице (на случай, если БД создавалась старым кодом)
     cursor.execute("PRAGMA table_info(processed_calls)")
     columns = [col[1] for col in cursor.fetchall()]
     
     if "admin_name" not in columns:
         try:
             cursor.execute("ALTER TABLE processed_calls ADD COLUMN admin_name TEXT DEFAULT 'Не определен'")
-            logger.info("[DB] Миграция: Добавлена колонка admin_name в существующую БД.")
+            logger.info("[DB] Миграция: Добавлена колонка admin_name.")
         except Exception as e:
             logger.error(f"[DB] Ошибка добавления колонки admin_name: {e}")
             
     if "clinic_branch" not in columns:
         try:
             cursor.execute("ALTER TABLE processed_calls ADD COLUMN clinic_branch TEXT DEFAULT 'Не определен'")
-            logger.info("[DB] Миграция: Добавлена колонка clinic_branch в существующую БД.")
+            logger.info("[DB] Миграция: Добавлена колонка clinic_branch.")
         except Exception as e:
             logger.error(f"[DB] Ошибка добавления колонки clinic_branch: {e}")
+
+    if "direction" not in columns:
+        try:
+            cursor.execute("ALTER TABLE processed_calls ADD COLUMN direction TEXT DEFAULT 'in'")
+            logger.info("[DB] Миграция: Добавлена колонка direction в существующую БД.")
+        except Exception as e:
+            logger.error(f"[DB] Ошибка добавления колонки direction: {e}")
     # -----------------------------------------------
 
-    # 2. Таблица системных флагов/настроек (для отслеживания 30 дней)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_settings (
             key TEXT PRIMARY KEY,
@@ -59,7 +65,6 @@ def init_db():
         )
     """)
     
-    # Индексы для оптимизации
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_id ON processed_calls(call_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_phone ON processed_calls(phone)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_calls(processed_at)")
@@ -83,21 +88,21 @@ def is_call_processed(call_key: str) -> bool:
         return False
 
 
-def save_analysis_to_db(call_key, call_id, record_id, start_time, duration, phone, analysis_text, status, record_url, admin_name="Не определен", clinic_branch="Не определен"):
-    """Сохранение результатов с явным указанием admin_name и clinic_branch в запросе"""
+def save_analysis_to_db(call_key, call_id, record_id, start_time, duration, phone, analysis_text, status, record_url, admin_name="Не определен", clinic_branch="Не определен", direction="in"):
+    """Сохранение результатов с явным указанием admin_name, clinic_branch и direction"""
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        # Вставили колонки admin_name и clinic_branch в структуру INSERT
         cursor.execute("""
             INSERT OR REPLACE INTO processed_calls 
-            (call_key, call_id, record_id, start_time, duration, phone, admin_name, clinic_branch, analysis_text, status, record_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (call_key, call_id, record_id, start_time, duration, phone, admin_name, clinic_branch, direction, analysis_text, status, record_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             str(call_key), str(call_id), str(record_id) if record_id else None,
             str(start_time) if start_time else "", int(duration or 0), str(phone) if phone else "",
             str(admin_name) if admin_name else "Не определен", 
             str(clinic_branch) if clinic_branch else "Не определен",
+            str(direction) if direction else "in",
             str(analysis_text) if analysis_text else None, str(status), str(record_url) if record_url else None
         ))
         conn.commit()
@@ -119,7 +124,6 @@ def clear_old_data(days: int = 30):
             logger.info(f"[DB] Cleaned {deleted_count} old rows from database.")
     except Exception as e:
         logger.error(f"[DB] Failed to clear old records: {e}")
-
 
 # =========================================================================
 # ХЕЛПЕРЫ ДЛЯ КОНТРОЛЯ СРОКА ОЧИСТКИ (ФЛАГИ В БД)
@@ -169,13 +173,13 @@ def reset_period():
 # =========================================================================
 
 def get_success_calls_for_master() -> list:
-    """Вытаскивает данные для мастера, включая админа и филиал"""
+    """Вытаскивает данные для мастера, включая админа, филиал и направление"""
     try:
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        # Добавляем phone четвертым по счету аргументом (после duration)
+        # Добавили direction в конец выборки
         cursor.execute("""
-            SELECT start_time, call_id, duration, phone, admin_name, clinic_branch, analysis_text, record_url 
+            SELECT start_time, call_id, duration, phone, admin_name, clinic_branch, analysis_text, record_url, direction 
             FROM processed_calls 
             WHERE status = 'success'
             ORDER BY start_time DESC
