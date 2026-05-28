@@ -13,7 +13,7 @@ def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     
-    # 1. Создаем таблицу звонков (если её вообще не было)
+    # 1. Создаем таблицу звонков
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS processed_calls (
             call_key            TEXT PRIMARY KEY,
@@ -28,7 +28,17 @@ def init_db():
             analysis_text       TEXT,
             status              TEXT DEFAULT 'success',
             processed_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            record_url          TEXT
+            record_url          TEXT,
+            report_url          TEXT
+        )
+    """)
+
+    # 2. создаем таблицу токенов
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS gas_accounts (
+            url                 TEXT PRIMARY KEY,
+            blocked_until       REAL DEFAULT 0, 
+            is_paid             INTEGER DEFAULT 0 
         )
     """)
     
@@ -56,6 +66,16 @@ def init_db():
             logger.info("[DB] Миграция: Добавлена колонка direction в существующую БД.")
         except Exception as e:
             logger.error(f"[DB] Ошибка добавления колонки direction: {e}")
+    
+    if "report_url" not in columns:
+        cursor.execute("ALTER TABLE processed_calls ADD COLUMN report_url TEXT")
+        logger.info("⚙️ [DB MIGRATION] Добавлена колонка 'report_url' для хранения публичных ссылок")
+
+    # добавляем урлы из конфига 
+    import config as cfg
+    gas_pool = getattr(cfg, 'GAS_POOL', [])
+    for url in gas_pool:
+        cursor.execute("INSERT OR IGNORE INTO gas_accounts (url, is_paid) VALUES (?, 0)", (url,))
     # -----------------------------------------------
 
     cursor.execute("""
@@ -189,4 +209,105 @@ def get_success_calls_for_master() -> list:
         return rows
     except Exception as e:
         logger.error(f"[DB] Error in get_success_calls_for_master: {e}")
+        return []
+    
+# =========================================================================
+# GAS ХЕЛПЕРЫ
+# =========================================================================
+
+def get_available_gas_url(is_paid: int = 0) -> str | None:
+    """Возвращает первый живой (не заблокированный) GAS URL из базы данных (0 - бесплатный, 1 - платный)"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        current_time = time.time()
+        
+        # Передаем параметр is_paid в запрос
+        cursor.execute("""
+            SELECT url FROM gas_accounts 
+            WHERE is_paid = ? AND blocked_until < ? 
+            LIMIT 1
+        """, (is_paid, current_time))
+        
+        row = cursor.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        logger.error(f"[DB] Ошибка при получении живого GAS (is_paid={is_paid}): {e}")
+        return None
+
+def block_gas_url(url: str, duration_seconds: int = 60):
+    """Помечает GAS-аккаунт как заблокированный на определенное время"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        blocked_until = time.time() + duration_seconds
+        
+        cursor.execute("""
+            UPDATE gas_accounts 
+            SET blocked_until = ? 
+            WHERE url = ?
+        """, (blocked_until, url))
+        
+        conn.commit()
+        conn.close()
+        logger.warning(f"🔒 [DB LIMIT] Аккаунт {url[-25:]} заблокирован в БД на {duration_seconds} сек.")
+    except Exception as e:
+        logger.error(f"[DB] Ошибка при блокировке GAS в базе: {e}")
+
+# === CALL ====
+def update_call_report_url_in_db(call_id: str, report_url: str):
+    """Сеттер: сохраняет постоянную публичную ссылку на индивидуальный отчет для звонка"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE processed_calls SET report_url = ? WHERE call_id = ?",
+            (report_url, str(call_id))
+        )
+        conn.commit()
+        conn.close()
+        logger.debug(f"💾 [DB SETTER] Ссылка на отчет {call_id} успешно сохранена.")
+    except Exception as e:
+        logger.error(f"❌ [DB SETTER ERROR] Не удалось сохранить ссылку для {call_id}: {e}")
+
+
+def get_success_calls_for_master() -> list:
+    """Геттер для watchdog: возвращает успешные звонки за последние 30 дней для локальной сборки"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        # Выбираем строго структурированный список полей
+        cursor.execute("""
+            SELECT start_time, call_id, duration, phone, admin_name, 
+                   clinic_branch, analysis_text, record_url, direction, report_url
+            FROM processed_calls
+            WHERE status = 'success'
+            ORDER BY start_time DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"❌ [DB GETTER ERROR] get_success_calls_for_master: {e}")
+        return []
+
+
+def get_all_calls_from_db_func() -> list:
+    """Геттер для sync_manager: возвращает абсолютно все успешные записи звонков из БД"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT start_time, call_id, duration, phone, admin_name, 
+                   clinic_branch, analysis_text, record_url, direction, report_url
+            FROM processed_calls
+            WHERE status = 'success'
+            ORDER BY start_time DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"❌ [DB GETTER ERROR] get_all_calls_from_db_func: {e}")
         return []

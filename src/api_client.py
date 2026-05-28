@@ -3,28 +3,51 @@ from __future__ import annotations
 import requests
 import time
 import json
-import io
 import base64
+import ssl
 
 from datetime import datetime, timedelta
 
 from utils.logs import setup_logger
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
+from tenacity import Retrying, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
+import re
 
 # Импортируем pydub для исправления бага с "глухотой" Gemini на первых секундах звонка
 from pydub import AudioSegment
 from pydub.generators import Sine
 
+from requests.exceptions import RequestException, SSLError
+
+from src.database import get_available_gas_url, block_gas_url
+
 import config as cfg
+
+# Отключаем строгую проверку конца TLS-протокола для Python 3.13 + OpenSSL 3.x
+try:
+    ctx = ssl.create_default_context()
+    if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+        ctx.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
+except AttributeError:
+    pass
 
 UNKNOWN_VALUE = "Не определен"
 
 logger = setup_logger("analyzer")
 
-# === МОД РАБОТЫ: GEMINI (по умолчанию) или WHISPER (локальная) ===
+# === КАСТОМНЫЕ ИСКЛЮЧЕНИЯ ДЛЯ УПРАВЛЕНИЯ ЦИКЛАМИ RETRY ===
+class ServiceUnavailableError(requests.RequestException):
+    """Исключение для HTTP 503 — сервер временно перегружен, ТРЕБУЕТСЯ РЕТРАЙ."""
+    pass
+
+class QuotaExceededException(Exception):
+    """Исключение для HTTP 429 или исчерпания лимитов квот — РЕТРАЙ НЕ НУЖЕН, меняем аккаунт."""
+    pass
+
+
 def get_analysis_mode():
     """Возвращает текущий режим анализа audio из config"""
     return getattr(cfg, 'AUDIO_ANALYSIS_MODE', 'gemini').lower().strip()
+
 
 def get_record(call_id: str, record_id: str, communication_id: str = None) -> bytes | None:
     if not communication_id:
@@ -44,7 +67,18 @@ def get_record(call_id: str, record_id: str, communication_id: str = None) -> by
 
     for url in urls_to_try:
         try:
-            r = requests.get(url, headers=headers, timeout=40)
+            logger.debug(f"| [DOWNLOAD] Попытка скачать запись для звонка {call_id}...")
+            
+            # Заворачиваем скачивание конкретного URL в tenacity
+            for attempt in Retrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential_jitter(initial=1, max=5, jitter=1),
+                retry=retry_if_exception_type((RequestException, SSLError)),
+                reraise=True
+            ):
+                with attempt:
+                    r = requests.get(url, headers=headers, timeout=40)
+            
             size_kb = len(r.content) // 1024
             content_type = r.headers.get('Content-Type', '').lower()
 
@@ -57,12 +91,12 @@ def get_record(call_id: str, record_id: str, communication_id: str = None) -> by
                 return r.content
             else:
                 logger.debug(f"| [DOWNLOAD] Attempt failed: {url} → {r.status_code} ({size_kb} KB)")
+                
         except Exception as e:
-            logger.debug(f"| [DOWNLOAD] Exception on {url}: {e}")
+            logger.debug(f"| [DOWNLOAD] Исключение (после ретраев) на {url}: {e}")
 
     logger.warning(f"| [DOWNLOAD] ❌ All attempts failed for {call_id}")
     return None
-
 
 def get_calls(hours_back: int = 24):
     """Получает список звонков с записями"""
@@ -82,30 +116,13 @@ def get_calls(hours_back: int = 24):
             "offset": 0,
             "include_ongoing_calls": False,
             "fields": [
-                "id", 
-                "start_time", 
-                "finish_time", 
-                "direction", 
-                "source", 
-                "is_lost", 
-                "communication_id", 
-                "communication_type",
-                "talk_duration", 
-                "wait_duration", 
-                "total_duration", 
-                "clean_talk_duration",
-                "contact_phone_number", 
-                "virtual_phone_number", 
-                "finish_reason", 
-                "cpn_region_id", 
-                "cpn_region_name",
-                "call_records", 
-                "wav_call_records",
-                "last_answered_employee_id",
-                "last_answered_employee_full_name",
-                "first_answered_employee_id",
-                "first_answered_employee_full_name",
-                "employees"
+                "id", "start_time", "finish_time", "direction", "source", "is_lost", 
+                "communication_id", "communication_type", "talk_duration", "wait_duration", 
+                "total_duration", "clean_talk_duration", "contact_phone_number", 
+                "virtual_phone_number", "finish_reason", "cpn_region_id", "cpn_region_name",
+                "call_records", "wav_call_records", "last_answered_employee_id",
+                "last_answered_employee_full_name", "first_answered_employee_id",
+                "first_answered_employee_full_name", "employees"
             ]
         }
     }
@@ -113,10 +130,21 @@ def get_calls(hours_back: int = 24):
     try:
         logger.info(f"[API] Запрос звонков: {hours_back}ч назад | {date_from} — {date_till}")
         
-        resp = requests.post(cfg.NOVOFON_DATAAPI, json=payload, timeout=30)
-        resp.raise_for_status()
+        # Заворачиваем запрос списка звонков в ретраи
+        for attempt in Retrying(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential_jitter(initial=2, max=7, jitter=1),
+            retry=retry_if_exception_type((RequestException, SSLError)),
+            reraise=True
+        ):
+            with attempt:
+                if attempt.retry_state.attempt_number > 1:
+                    logger.warning(f"⏳ [API RETRY] Повторный запрос списка звонков, попытка №{attempt.retry_state.attempt_number}")
+                resp = requests.post(cfg.NOVOFON_DATAAPI, json=payload, timeout=30)
+                resp.raise_for_status()
         
         full_response = resp.json()
+        print(full_response)
         result = full_response.get("result", {})
         data = result.get("data", [])
         
@@ -125,17 +153,21 @@ def get_calls(hours_back: int = 24):
         calls = []
         skipped_no_record = 0
 
-        if data:
+        if data and isinstance(data, list) and isinstance(data[0], dict):
             logger.info(f"[DEBUG_RAW_CALL] Сырая структура звонка: {json.dumps(data[0], ensure_ascii=False)}")
 
         for call in data:
+            if not isinstance(call, dict):
+                logger.warning(f"[API WARN] Элемент call пришел не в виде dict: {type(call)} -> {call}")
+                continue
+
             call_id = str(call.get("id"))
             communication_id = str(call.get("communication_id") or call.get("id"))
             start_time = call.get("start_time")
+            
             talk_duration = int(call.get("talk_duration") or call.get("duration") or 0)
             
             admin_name = UNKNOWN_VALUE
-
             if call.get("last_answered_employee_full_name"):
                 admin_name = call.get("last_answered_employee_full_name").strip()
             elif call.get("first_answered_employee_full_name"):
@@ -143,9 +175,12 @@ def get_calls(hours_back: int = 24):
             
             if admin_name == UNKNOWN_VALUE:
                 for emp in (call.get("employees") or []):
-                    if emp.get("employee_full_name"):
+                    if isinstance(emp, dict) and emp.get("employee_full_name"):
                         admin_name = emp.get("employee_full_name").strip()
                         break
+            
+            if admin_name != UNKNOWN_VALUE:
+                admin_name = re.sub(r'\s*-\s*\d+.*$', '', admin_name).strip()
 
             call_records = call.get("call_records") or []
             wav_records = call.get("wav_call_records") or []
@@ -161,6 +196,7 @@ def get_calls(hours_back: int = 24):
                 "admin_name": admin_name,
                 "is_lost": call.get("is_lost", False),
                 "direction": call.get("direction"),
+                "call_records": records_to_use
             }
 
             if not records_to_use:
@@ -171,224 +207,297 @@ def get_calls(hours_back: int = 24):
 
             for rec_id in records_to_use:
                 record_call = base_call.copy()
-                record_call["record_id"] = str(rec_id)
+                if isinstance(rec_id, dict):
+                    record_call["record_id"] = str(rec_id.get("id", ""))
+                else:
+                    record_call["record_id"] = str(rec_id)
                 calls.append(record_call)
 
-        logger.info(f"[API] Итого сформировано {len(calls)} записей | Без записи: {skipped_no_record}")
-
-        if calls:
-            logger.debug(f"Пример звонка: {json.dumps(calls[0], ensure_ascii=False, indent=2)[:600]}")
-
         print(calls)
-
+        logger.info(f"[API] Итого сформировано {len(calls)} записей | Без записи: {skipped_no_record}")
         return calls
 
     except Exception as e:
-        logger.error(f"[API] Failed to fetch calls: {e}", exc_info=True)
+        logger.error(f"[API] Failed to fetch calls после всех попыток ретрая: {e}", exc_info=True)
         return []
-    
+
+
 def analyze_audio(audio_bytes: bytes, call_info: dict) -> str | None:
     """
-    Анализирует аудио: либо через Gemini Apps Script, либо через локальный Whisper + Gemini.
-    Режим работы переключается в config.AUDIO_ANALYSIS_MODE ('gemini' | 'whisper').
+    ГЛАВНЫЙ ДИСПЕТЧЕР: Вызывается из call.py.
     """
-    mode = get_analysis_mode()
+    if not audio_bytes or len(audio_bytes) < 1024:
+        logger.warning("| [ANALYZE] Пустые или поврежденные байты аудио, отмена запроса.")
+        return None
 
-    if mode == 'whisper':
-        logger.info(f"| [MODE] Whisper → Gemini pipeline активен для {call_info.get('id', 'unknown')}")
-        return _analyze_audio_whisper_pipeline(audio_bytes, call_info)
-    else:
-        logger.info(f"| [MODE] Gemini direct (legacy) для {call_info.get('id', 'unknown')}")
-        return _analyze_audio_gemini(audio_bytes, call_info)
+    c_id = str(call_info.get('id', 'unknown'))
+    talk_duration = int(call_info.get('duration', 0))
+    direction = str(call_info.get('direction', 'in'))
+
+    # 1. Попытка через бесплатный пул GAS (is_paid_pool=0)
+    logger.info(f"| [DISPATCHER] Отправка АУДИО звонка {c_id} в пул бесплатных GAS...")
+    free_result = _execute_analysis_via_pool(
+        c_id=c_id, 
+        talk_duration=talk_duration, 
+        audio_bytes=audio_bytes, 
+        call_info=call_info, 
+        direction=direction, 
+        is_paid_pool=0
+    )
+    if free_result:
+        return free_result
+
+    # 2. Если бесплатный пул исчерпан — уходим на платный fallback
+    logger.warning(f"🚨 [DISPATCHER] Бесплатный пул исчерпан. Переключаемся на платный fallback по аудио...")
+    return analyze_audio_via_paid_api(
+        c_id=c_id, 
+        talk_duration=talk_duration, 
+        audio_bytes=audio_bytes, 
+        call_info=call_info, 
+        direction=direction
+    )
 
 
-@retry(
-    retry=retry_if_exception_type((requests.exceptions.RequestException, Exception)),
-    wait=wait_exponential_jitter(initial=12, max=120),
-    stop=stop_after_attempt(15),
-    reraise=True
-)
-@retry(
-    retry=retry_if_exception_type((requests.exceptions.RequestException, Exception)),
-    wait=wait_exponential_jitter(initial=15, max=180),
-    stop=stop_after_attempt(5),
-    reraise=True
-)
-def _analyze_audio_gemini(audio_bytes: bytes, call_info: dict) -> str | None:
+def _execute_analysis_via_pool(c_id: str, talk_duration: int, audio_bytes: bytes, call_info: dict, direction: str, is_paid_pool: int = 0) -> str | None:
+    """Обобщенная подфункция перебора URL из выбранного пула с контролируемыми ретраями через tenacity"""
+    audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
     
-    c_id = call_info.get('id', 'unknown')
-    direction = call_info.get('direction', 'in') 
-    size_kb = len(audio_bytes) / 1024
-    logger.info(f"| [APPS_SCRIPT] Отправка записи {c_id} [{direction}], исходный размер: {size_kb:.1f} KB")
-
-    try:
-        # === ХАК: Подмешиваем искусственный сигнал на старте, чтобы разбудить VAD у Gemini Flash-Lite ===
-        try:
-            logger.debug(f"| [PYDUB] Накатываем пре-паддинг шума на звонок {c_id}")
-            # Загружаем байты mp3 из Новофона в pydub
-            original_audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
-            
-            # Генерируем 3 секунды (3000 мс) очень тихого (-40 dB) звукового синуса (440 Гц)
-            # Это заставит алгоритмы Google считать, что полезный звук идет с самого начала
-            padding = Sine(440).to_audio_segment(duration=3000).apply_gain(-40)
-            
-            # Склеиваем пре-паддинг с оригинальной записью
-            padded_audio = padding + original_audio
-            
-            # Выгружаем результат обратно в байты mp3
-            output_buffer = io.BytesIO()
-            padded_audio.export(output_buffer, format="mp3")
-            processed_bytes = output_buffer.getvalue()
-            
-            logger.debug(f"| [PYDUB] Пре-паддинг успешно добавлен. Размер файла: {len(processed_bytes)/1024:.1f} KB")
-        except Exception as pydub_err:
-            # Если ffmpeg не установлен или pydub упал — логируем, но не ломаем скрипт, шлём оригинал
-            logger.error(f"| [PYDUB] ⚠ Не удалось применить фикс аудио: {pydub_err}. Отправляем сырые байты.")
-            processed_bytes = audio_bytes
-
-        # Кодируем обработанные байты в Base64
-        # Кодируем обработанные байты в Base64
-        audio_b64 = base64.b64encode(processed_bytes).decode('utf-8')
-
-        # Формируем системный промпт (инструкцию для анализа)
-        system_instruction = (
-            f"Ты — аудитор звонков в медицинском центре. Проанализируй этот звонок. "
-            f"Информация о звонке: ID: {c_id}, Направление: {direction}, Длительность: {call_info.get('duration', '')} сек."
-        )
-
-        # Собираем OpenAI/OpenRouter-совместимую структуру
-        payload = {
-            "messages": [
-                {
-                    "role": "system",
-                    "content": system_instruction
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Сделай транскрибацию и заполни JSON-отчет по правилам клиники."
-                        },
-                        {
-                            "type": "input_audio",
-                            "input_audio": {
-                                "data": audio_b64,
-                                "format": "mp3"  # Для 'audio/mpeg' (mp3) передаем именно "mp3"
-                            }
-                        }
-                    ]
-                }
-            ],
-            "temperature": 0.0,
-            "response_format": {
-                "type": "json_object"
-            }
+    payload = {
+        'call_id': str(c_id),
+        'phone': str(call_info.get('phone', '')),
+        'duration': str(talk_duration),
+        'direction': str(direction),
+        'audio_base64': audio_b64,
+        'mime_type': 'audio/mpeg',
+        'generationConfig': {
+            'temperature': 0.0,
+            'responseMimeType': "application/json"
         }
+    }
 
-        response = requests.post(
-            cfg.APPS_SCRIPT_URL,
-            json=payload,
-            timeout=360
-        )
+    tried_urls = set()
+    pool_name = "PAID_GAS" if is_paid_pool == 1 else "FREE_GAS"
 
-        if response.status_code == 200:
-            result_text = response.text.strip()
-            logger.info(f"| [APPS_SCRIPT] Response OK for {c_id}")
+    def before_sleep_log(retry_state):
+        logger.warning(f"⏳ [{pool_name} TENACITY] Попытка {retry_state.attempt_number} не удалась. Локальный перезапуск текущего URL...")
 
-            if "Gemini API error 503" in result_text or "service is currently unavailable" in result_text:
-                logger.warning(f"| [GEMINI 503] Сервис перегружен для {c_id}, будет retry")
-                raise Exception(f"Gemini 503 Overload: {result_text[:300]}")
+    while True:
+        try:
+            gas_url = get_available_gas_url(is_paid=is_paid_pool) if is_paid_pool == 1 else get_available_gas_url()
+        except TypeError:
+            gas_url = get_available_gas_url() if is_paid_pool == 0 else None
+        
+        if not gas_url or gas_url in tried_urls:
+            logger.warning(f"⚠️ [{pool_name}] Доступные аккаунты в пуле закончились или все заблокированы.")
+            break 
 
-            try:
-                json.loads(result_text)
-                print(result_text)
-                return result_text
-            except:
-                logger.warning(f"| [JSON] Некорректный JSON от GAS: {result_text[:300]}")
-                return None
-        else:
-            logger.error(f"| [HTTP {response.status_code}] {response.text[:200]}")
-            return None
-    except Exception as e:
-        logger.error(f"✗ Исключение при вызове Apps Script для {c_id}: {e}")
-        if "Gemini 503" in str(e):
-            raise
+        try:
+            logger.info(f"| [{pool_name}] Запрос к GAS: ...{gas_url[-25:]}")
+
+            # Ретрай-политика tenacity охраняет от сетевых падений, HTTP 503 и "замаскированных" ошибок внутри JSON
+            for attempt in Retrying(
+                stop=stop_after_attempt(3),
+                wait=wait_exponential_jitter(initial=3, max=15, jitter=2),
+                retry=retry_if_exception_type((requests.RequestException, ServiceUnavailableError)),
+                before_sleep=before_sleep_log,
+                reraise=True
+            ):
+                with attempt:
+                    response = requests.post(gas_url, json=payload, timeout=240)
+
+                    if response.status_code == 503:
+                        logger.warning(f"⏳ [{pool_name} 503] Сервер Google перегружен (High Demand). Запускаем tenacity retry...")
+                        raise ServiceUnavailableError("Google 503 Service Unavailable")
+
+                    result_text = response.text.strip()
+
+                    # Обработка лимитов 429 (в HTTP-статусе или в тексте ответа Google Scripts)
+                    if response.status_code == 429 or any(err in result_text for err in ["Gemini API error 429", "Too Many Requests", "Quota exceeded"]):
+                        logger.warning(f"⚠️ [{pool_name} 429] На аккаунте кончились лимиты. Блок на 10 мин. Меняем прокси.")
+                        block_gas_url(gas_url, duration_seconds=600)
+                        raise QuotaExceededException()
+
+                    if "Gemini API error 503" in result_text or "service is currently unavailable" in result_text:
+                        logger.warning(f"⏳ [{pool_name} 503 Text] Сервер Google перегружен внутри ответа GAS. Ретраим через tenacity...")
+                        raise ServiceUnavailableError("Google 503 Service Unavailable inside JSON")
+
+                    if response.status_code != 200:
+                        logger.error(f"| [{pool_name} HTTP {response.status_code}] Ошибка прокси. Блок на 45 сек.")
+                        block_gas_url(gas_url, duration_seconds=45)
+                        raise QuotaExceededException()
+
+                    # Валидируем JSON перед возвратом и проверяем внутреннее поле "error"
+                    try:
+                        parsed_res = json.loads(result_text)
+                        
+                        # КРИТИЧЕСКИЙ ФИКС: Проверяем, не подсунул ли GAS ошибку под видом успешного JSON
+                        if isinstance(parsed_res, dict) and "error" in parsed_res:
+                            err_msg = str(parsed_res["error"])
+                            if "503" in err_msg or "UNAVAILABLE" in err_msg:
+                                logger.warning(f"⏳ [{pool_name} Fake 200] Обнаружена замаскированная ошибка 503. Ретраим...")
+                                raise ServiceUnavailableError(f"Zamaskirovannaya 503: {err_msg}")
+                            else:
+                                logger.warning(f"| [{pool_name} JSON_ERROR_FIELD] В ответе поле error: {err_msg}. Блок на 1 мин.")
+                                block_gas_url(gas_url, duration_seconds=60)
+                                raise QuotaExceededException()
+                        
+                        print(result_text)
+                        logger.info(f"✅ [{pool_name}] Успешно обработано через GAS для {c_id}")
+                        return result_text
+                    except json.JSONDecodeError:
+                        logger.warning(f"| [{pool_name} JSON_ERR] Некорректный JSON от GAS. Блок на 1 мин.")
+                        block_gas_url(gas_url, duration_seconds=60)
+                        raise QuotaExceededException()
+
+        except QuotaExceededException:
+            # Управляемо переходим к следующему URL в пуле
+            tried_urls.add(gas_url)
+            continue
+        except Exception as e:
+            # Сюда залетаем, если ВСЕ попытки tenacity на данном URL (включая фейковые 503) провалились
+            logger.warning(f"| [{pool_name} URL_FAILED] URL окончательно отвалился по таймауту/ошибкам: {e}")
+            block_gas_url(gas_url, duration_seconds=45)
+            tried_urls.add(gas_url)
+            continue
+
+    return None
+
+
+def analyze_audio_via_paid_api(c_id: str, talk_duration: int, audio_bytes: bytes, call_info: dict, direction: str) -> str | None:
+    """Резервный метод отправки напрямую на OpenRouter."""
+    logger.info(f"🪙 [PAID_FALLBACK] Проверяем платный пул в базе данных...")
+    paid_gas_result = _execute_analysis_via_pool(c_id, talk_duration, audio_bytes, call_info, direction, is_paid_pool=1)
+    if paid_gas_result:
+        return paid_gas_result
+
+    logger.info(f"🪙 [PAID_FALLBACK] Платного пула в БД нет. Бьем напрямую в OPENROUTER_GAS_URL...")
+    gas_url = getattr(cfg, 'OPENROUTER_GAS_URL', None)
+    if not gas_url:
+        logger.error("❌ КРИТИЧЕСКИ: OPENROUTER_GAS_URL отсутствует в config.py! Платный анализ невозможен.")
         return None
+
+    dir_text = "ИСХОДЯЩИЙ звонок от администратора клиенту" if direction == "out" else "ВХОДЯЩИЙ звонок от клиента в клинику"
     
-@retry(
-    retry=retry_if_exception_type((requests.exceptions.RequestException, Exception)),
-    wait=wait_exponential_jitter(initial=12, max=120),
-    stop=stop_after_attempt(15),
-    reraise=True
-)
-@retry(
-    retry=retry_if_exception_type((requests.exceptions.RequestException, Exception)),
-    wait=wait_exponential_jitter(initial=15, max=180),
-    stop=stop_after_attempt(5),
-    reraise=True
-)
-def _analyze_audio_whisper_pipeline(audio_bytes: bytes, call_info: dict) -> str | None:
-    """
-    НОВЫЙ РЕЖИМ: Whisper (локально) → текст → Gemini (Apps Script, TextIn).
-    Транскрибирует аудио локально, затем шлёт транскрипт + метаданные в Gemini.
-    """
-    from transcriber import transcribe_audio_locally
+    full_prompt = f"""
+Ты — профессиональный аудитор контроля качества звонков в ветеринарной клинике.
+Прослушай запись и проведи строгий аудит по критериям качества.
+ТЕКУЩИЙ КОНТЕКСТ ЗВОНКА: Это {dir_text}. Учти это при анализе!
 
-    c_id = call_info.get('id', 'unknown')
-    direction = call_info.get('direction', 'in')
+### ИНСТРУКЦИИ ПО ИЗВЛЕЧЕНИЮ ФАКТОВ (КРИТИЧЕСКИ ВАЖНО):
+1. ПРИВЕТСТВИЕ: Первые 3 секунды — технический паддинг (шум). Приветствие администратора начинается ПОСЛЕ 3-й секунды. Запиши точную дословную фразу в "raw_call_greeting".
+3. ИМЯ И ФАМИЛИЯ АДМИНИСТРАТОРА: Вытащи реальное имя. Будь внимателен (Алевтина ≠ Альбина). Склей имя и фамилию за весь звонок. Если фамилии не было — только имя. Если имя не прозвучало — "Не представился(-ась)".
+4. ИМЯ КЛИЕНТА И ПИТОМЦА: Зафиксируй имя владельца и кличку животного.
 
-    logger.info(f"| [WHISPER→GEMINI] Начинаем конвейер для {c_id} [{direction}]")
+### СТРУКТУРА ОЦЕНКИ (максимум 43 балла):
+1. Установление контакта (max 2)
+2. Использование имени (max 2) — минимум 2 обращения по имени.
+3. Выяснение потребностей (max 9)
+4. Презентация услуг (max 7)
+5. Презентация цен (max 3)
+6. Работа с возражениями (max 4)
+7. Ведение к записи (max 8)
+8. Завершение диалога (max 3)
+9. Индивидуальный подход (max 5)
 
-    # --- Шаг 1: Локальная транскрибация через Whisper ---
-    transcript_text = transcribe_audio_locally(audio_bytes)
+### КАТЕГОРИИ:
+1 (43-37), 2 (36-30), 3 (29-23), 4 (22 и менее).
 
-    if not transcript_text:
-        logger.error(f"| [WHISPER→GEMINI] ⚠ Транскрипт пуст для {c_id}. Пропускаем.")
-        return None
-
-    word_count = len(transcript_text.split())
-    logger.info(f"| [WHISPER→GEMINI] Транскрипт получен: {word_count} слов, {len(transcript_text)} символов")
-    logger.debug(f"| [WHISPER→GEMINI] Первые 300 символов транскрипта: {transcript_text[:300]}")
-
-    # --- Шаг 2: Отправляем транскрипт в Gemini Apps Script как текст ---
+### ВЫДАЙ СТРОГО В ФОРМАТЕ JSON (без markdown, без лишнего текста):
+{{
+  "raw_call_greeting": "Точный дословный текст приветствия",
+  "admin_name": "Имя Фамилия администратора",
+  "appointment_made": true/false,
+  "total_score": число,
+  "category": число,
+  "dialog_overview": "Подробный пересказ ключевых моментов",
+  "details": {{
+    "contact": {{"score": число, "comment": "Обоснование"}},
+    "name_usage": {{"score": число, "comment": "Обоснование"}},
+    "needs_analysis": {{"score": число, "comment": "Обоснование"}},
+    "presentation": {{"score": число, "comment": "Обоснование"}},
+    "pricing": {{"score": число, "comment": "Обоснование"}},
+    "objections": {{"score": число, "comment": "Обоснование"}},
+    "closing_to_appointment": {{"score": число, "comment": "Обоснование"}},
+    "termination": {{"score": число, "comment": "Обоснование"}},
+    "individual_approach": {{"score": число, "comment": "Обоснование"}}
+  }}
+}}
+"""
     try:
+        audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
         payload = {
             'call_id': str(c_id),
             'phone': str(call_info.get('phone', '')),
-            'duration': str(call_info.get('duration', '')),
+            'duration': str(talk_duration),
             'direction': str(direction),
-            'transcript': transcript_text,
-            'generationConfig': {
-                'temperature': 0.0,
-                'responseMimeType': "application/json"
-            }
+            'audio_base64': audio_b64,
+            'mime_type': 'audio/mpeg',
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": full_prompt},
+                        {"type": "input_audio", "input_audio": {"data": audio_b64, "format": "mp3"}}
+                    ]
+                }
+            ],
+            "model": "google/gemini-2.5-flash",
+            "temperature": 0.0,
+            "response_format": {"type": "json_object"}
         }
 
-        response = requests.post(cfg.APPS_SCRIPT_URL, json=payload, timeout=360)
+        def before_sleep_openrouter_log(retry_state):
+            logger.warning(f"⏳ [OPENROUTER TENACITY] Попытка {retry_state.attempt_number} не удалась. Повторяем...")
 
-        if response.status_code == 200:
-            result_text = response.text.strip()
-            logger.info(f"| [WHISPER→GEMINI] Response OK for {c_id}")
+        try:
+            for attempt in Retrying(
+                stop=stop_after_attempt(4),
+                wait=wait_exponential_jitter(initial=5, max=30, jitter=3),
+                retry=retry_if_exception_type((requests.RequestException, ServiceUnavailableError)),
+                before_sleep=before_sleep_openrouter_log,
+                reraise=True
+            ):
+                with attempt:
+                    logger.info(f"🚀 [DIRECT_OPENROUTER] Запрос к API OpenRouter. Попытка №{attempt.retry_state.attempt_number or 1}")
+                    response = requests.post(gas_url, json=payload, timeout=180)
+                    
+                    if response.status_code == 503:
+                        logger.warning(f"⚠️ [DIRECT_OPENROUTER] Код 503 (Unavailable) от OpenRouter. Ретраим через tenacity...")
+                        raise ServiceUnavailableError("OpenRouter 503 Service Unavailable")
+                    
+                    if response.status_code == 429:
+                        logger.error("❌ [DIRECT_OPENROUTER] Ошибка 429 Лимиты исчерпаны. Немедленный выход.")
+                        return None
 
-            if "Gemini API error 503" in result_text or "service is currently unavailable" in result_text:
-                logger.warning(f"| [GEMINI 503] Сервис перегружен для {c_id}, будет retry")
-                raise Exception(f"Gemini 503 Overload: {result_text[:300]}")
+                    if response.status_code != 200:
+                        logger.error(f"❌ [DIRECT_OPENROUTER ERROR {response.status_code}] {response.text[:200]}")
+                        return None
 
-            try:
-                json.loads(result_text)
-                print(result_text)
-                return result_text
-            except:
-                logger.warning(f"| [JSON] Некорректный JSON от GAS: {result_text[:300]}")
-                return None
-        else:
-            logger.error(f"| [HTTP {response.status_code}] {response.text[:200]}")
+                    # Разбор ответа OpenRouter
+                    try:
+                        resp_json = response.json()
+                        choices = resp_json.get("choices", [])
+                        if choices:
+                            content_text = choices[0].get("message", {}).get("content", "").strip()
+                        else:
+                            content_text = response.text.strip()
+                    except Exception:
+                        content_text = response.text.strip()
+
+                    # Финальная очистка и валидация
+                    try:
+                        json.loads(content_text)
+                        print(content_text)
+                        return content_text
+                    except Exception:
+                        cleaned = content_text.replace("```json", "").replace("```", "").strip()
+                        print(cleaned)
+                        return cleaned
+
+        except Exception as retry_exc:
+            logger.error(f"❌ [OPENROUTER FAILED] Все попытки исчерпаны. Не удалось получить ответ: {retry_exc}")
             return None
+
     except Exception as e:
-        logger.error(f"| [WHISPER→GEMINI] Ошибка отправки в Apps Script для {c_id}: {e}")
-        if "Gemini 503" in str(e):
-            raise
+        logger.error(f"❌ Крах прямого OpenRouter запроса: {e}")
         return None
-
-

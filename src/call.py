@@ -1,5 +1,4 @@
 import json
-import time
 import re
 
 from utils.logs import setup_logger
@@ -7,6 +6,7 @@ from utils.logs import setup_logger
 from src.api_client import get_record, analyze_audio
 from src.excel_maker import create_call_report
 from src.database import is_call_processed, save_analysis_to_db
+from utils.is_audio_empty import is_audio_empty
 
 import config as cfg
 
@@ -30,6 +30,42 @@ def process_single_call(call: dict) -> str:
         call_id = str(call.get('id'))
         logger.debug(f"Проверка звонка {call_id}")
 
+        # =====================================================================
+        # 🚫 1. ФИЛЬТР: ВИРТУАЛЬНЫЙ НОМЕР (ИЗ КОНФИГА)
+        # =====================================================================
+        virtual_phone = str(call.get('virtual_phone_number') or call.get('did') or call.get('destination') or '').strip()
+        # Очищаем от лишних символов, если они есть (например, +, пробелы, скобки)
+        cleaned_virtual = re.sub(r'\D', '', virtual_phone)
+
+        # Подгружаем черный список номеров из конфига (по дефолту пустой список, если забыл указать)
+        blocked_numbers = getattr(cfg, 'BLOCK_NUMBERS', [])
+        
+        # Проверяем, совпадает ли конец номера или содержится ли он в списке
+        for b_num in blocked_numbers:
+            b_num_clean = re.sub(r'\D', '', str(b_num))
+            if b_num_clean and (b_num_clean in cleaned_virtual or cleaned_virtual.endswith(b_num_clean)):
+                logger.info(f"🚫 [BLACKLIST] Звонок {call_id} пропущен: виртуальный номер {virtual_phone} в черном списке конфига.")
+                return "skipped"
+
+        # =====================================================================
+        # 🚫 2. ФИЛЬТР: АДМИНИСТРАТОР (ИЗ КОНФИГА)
+        # =====================================================================
+        employees = call.get('employees', [])
+        emp_name = employees[0].get('employee_full_name', '') if employees else ''
+        
+        novofon_admin = str(
+            call.get('admin_name') or 
+            call.get('first_answered_employee_full_name') or 
+            call.get('last_answered_employee_full_name') or 
+            emp_name or ''
+        ).strip().lower()
+
+        blocked_admins = getattr(cfg, 'BLOCK_ADMINS', [])
+        
+        if any(b_admin.strip().lower() in novofon_admin for b_admin in blocked_admins if b_admin):
+            logger.info(f"🚫 [BLACKLIST] Звонок {call_id} пропущен: администратор '{novofon_admin}' забанен в конфиге.")
+            return "skipped"
+
         record_id = call.get('record_id')
         if isinstance(record_id, dict) and 'id' in record_id:
             record_id = record_id.get('id')
@@ -38,116 +74,87 @@ def process_single_call(call: dict) -> str:
         direction = call.get('direction', 'in')
 
         if not record_id:
-            logger.debug(f"| [SKIP] Звонок {call_id} — нет record_id")
+            logger.debug(f"○ Пропущен звонок {call_id}: нет record_id (нет записи разговора)")
             return "skipped"
 
-        if talk_duration < 7:
-            logger.debug(f"| [SKIP] Звонок {call_id} — слишком короткий ({talk_duration} сек)")
+        if talk_duration < getattr(cfg, 'MIN_CALL_DURATION_SEC', 25):
+            logger.debug(f"○ Пропущен звонок {call_id}: длительность {talk_duration} сек. меньше лимита")
             return "skipped"
 
-        if call.get('is_lost') and talk_duration == 0:
-            logger.debug(f"| [SKIP] Звонок {call_id} — потерянный")
-            return "skipped"
-
-        call['record_id'] = str(record_id)
         call_key = generate_call_key(call)
-
         if is_call_processed(call_key):
-            logger.debug(f"○ Уже обработан: {call_key}")
+            logger.debug(f"○ Пропущен звонок {call_id}: уже обработан ранее (key: {call_key})")
             return "skipped"
 
-        # === ФИЛЬТРАЦИЯ BLOCK_NUMBERS ===
-        virtual_num = call.get('virtual_phone_number')
-        if virtual_num:
-            clean_virtual = clean_to_10_digits(virtual_num)
-            clean_block_list = [clean_to_10_digits(num) for num in getattr(cfg, 'BLOCK_NUMBERS', []) if num]
+        admin_name = call.get('admin_name') or UNKNOWN_VALUE
+        customer_phone = call.get('phone') or UNKNOWN_VALUE
 
-            if clean_virtual and clean_virtual in clean_block_list:
-                logger.info(f"| [SKIP] Отфильтровано BLOCK_NUMBERS. Виртуальный: {virtual_num} (сравнение по {clean_virtual})")
-                return "skipped"
+        logger.info(f"→ Новый звонок для анализа: {call_id} | {customer_phone} | {talk_duration} сек. | Направление: {direction}")
 
-        logger.info(f"→ Новый звонок для анализа: {call_id} | {call.get('phone')} | {talk_duration} сек. | Направление: {direction}")
-
-        # Скачивание записи
+        # === Скачиваем аудиофайл звонка ===
         audio = get_record(call_id, record_id, call.get('communication_id'))
         if not audio:
-            logger.warning(f"✗ Не удалось скачать запись {call_id}")
-            record_url = f"https://app.novofon.ru/system/media/talk/{call.get('communication_id') or call_id}/{record_id}/"
+            logger.warning(f"❌ Не удалось скачать аудио для звонка {call_id}")
+            return "error"
+        
+        # === Проверяем на пустоту ===
+        if is_audio_empty(audio):
+            logger.info(f"⏭️ Звонок {call_id} пропущен: в записи только гудки или тишина.")
+            
+            # Сохраняем в базу со статусом skipped, чтобы больше не дергать
             save_analysis_to_db(
                 call_key=call_key, call_id=call_id, record_id=record_id,
                 start_time=call.get('start_time'), duration=talk_duration,
-                phone=call.get('contact_phone_number'), analysis_text=None, status="download_failed",
-                record_url=record_url, admin_name=UNKNOWN_VALUE, clinic_branch=UNKNOWN_VALUE,
+                phone=customer_phone, analysis_text="{}",
+                status="skipped", record_url="",
+                admin_name=admin_name, clinic_branch=UNKNOWN_VALUE,
                 direction=direction
             )
+            return "skipped"
+
+        # === Отправляем аудио на анализ диспетчеру (он сам решит: бесплатный GAS или платный fallback) ===
+        logger.info(f"⚡ Gemini анализ (попытка 1/3): {call_id}")
+        raw_response = analyze_audio(audio, call)
+
+        if not raw_response:
+            logger.error(f"❌ Все попытки анализа звонка {call_id} завершились неудачей (вернулся None)")
             return "error"
 
-        # Анализ через Gemini (с повторами)
-        analysis_json = None
-        for attempt in range(3):
-            try:
-                logger.info(f"⚡ Gemini анализ (попытка {attempt+1}/3): {call_id}")
-                raw_response = analyze_audio(audio, call)
-                
-                if not raw_response:
-                    raise Exception("Пустой ответ от analyze_audio")
-                
-                try:
-                    check_error = json.loads(raw_response)
-                    if "error" in check_error:
-                        error_msg = check_error["error"]
-                        logger.warning(f"⚠ Обнаружена ошибка API в ответе Gemini: {error_msg}")
-                        
-                        if "429" in str(error_msg) or "quota" in str(error_msg).lower():
-                            logger.info("⏳ Превышена квота (429). Засыпаем на 25 секунд...")
-                            time.sleep(60)
-                        raise Exception(f"Gemini API Error: {error_msg}")
-                except json.JSONDecodeError:
-                    pass
-                        
-                analysis_json = raw_response
-                break
-
-            except Exception as e:
-                logger.warning(f"Попытка {attempt+1} не удалась: {e}")
-                if attempt < 2:
-                    time.sleep(10 if "503" in str(e) else 5)
-
-        customer_phone = call.get('contact_phone_number') or call.get('phone') or UNKNOWN_VALUE
-        record_url = f"https://app.novofon.ru/system/media/talk/{call.get('communication_id') or call_id}/{record_id}/"
-        novofon_device = call.get('admin_name') or call.get('employee_name') or call.get('responsible_ear_name') or UNKNOWN_VALUE
-
-        # Если анализ провалился после всех попыток
-        if not analysis_json:
-            logger.error(f"✗ Анализ не удался после 3 попыток: {call_id}")
-            save_analysis_to_db(
-                call_key=call_key, call_id=call_id, record_id=record_id,
-                start_time=call.get('start_time'), duration=talk_duration,
-                phone=customer_phone, analysis_text=None,
-                status="gemini_failed", record_url=record_url,
-                admin_name=novofon_device, clinic_branch=UNKNOWN_VALUE,
-                direction=direction
-            )
-            return "error"
-
-        # === УМНЫЙ МЭТЧИНГ ИМЕНИ ДЛЯ БАЗЫ И ОТЧЕТОВ ===
+        # === ПАРСИНГ ОТВЕТА ===
         clinic_branch = UNKNOWN_VALUE
-        final_admin_display = novofon_device
+        final_admin_display = admin_name
+        analysis_json = raw_response
 
         try:
-            parsed = json.loads(analysis_json)
-            clinic_branch = parsed.get("clinic_branch", UNKNOWN_VALUE)
-            ai_extracted_name = parsed.get("admin_name", "").strip()
+            parsed = json.loads(raw_response)
             
-            if ai_extracted_name and ai_extracted_name not in ["Не определен", "Не представился(-ась)"]:
-                if novofon_device == UNKNOWN_VALUE:
-                    final_admin_display = ai_extracted_name
-                elif ai_extracted_name.lower() in str(novofon_device).lower():
-                    final_admin_display = novofon_device
-                else:
-                    final_admin_display = f"{novofon_device} ({ai_extracted_name})"
-            
-            # Зашиваем красивое имя обратно в JSON, чтобы индивидуальный отчет съел его автоматически
+            # Извлекаем базовые поля отчета
+            clinic_branch = parsed.get("clinic_branch")
+            if not clinic_branch or clinic_branch == "null": 
+                clinic_branch = UNKNOWN_VALUE
+
+            # === Красивая склейка имени администратора ===
+            # 1. Берем имя линии из Новофона (переменная admin_name из начала функции)
+            novofon_tube = admin_name.strip() if admin_name else ""
+            if novofon_tube in ["Не определен", "UNKNOWN_VALUE", "null", "None"]:
+                novofon_tube = ""
+
+            # 2. Вытаскиваем имя, которое нашла нейронка
+            gemini_admin = parsed.get("admin_name", "").strip()
+            if gemini_admin in ["Не представился(-ась)", "Не определен", "null", "None"]:
+                gemini_admin = ""
+
+            # 3. Скрепляем строго по формату: admin_full_name (имя вытащенное нейронкой)
+            if novofon_tube and gemini_admin:
+                final_admin_display = f"{novofon_tube} ({gemini_admin})"  # Оба есть -> "Marjino 120 (Анастасия)"
+            elif novofon_tube:
+                final_admin_display = novofon_tube                        # Только Новофон -> "Marjino 120"
+            elif gemini_admin:
+                final_admin_display = gemini_admin                        # Только нейронка -> "Анастасия"
+            else:
+                final_admin_display = "Не определен"                      # Если вообще пусто с обеих сторон (крайний случай)
+
+            # Перезаписываем в JSON, чтобы excel_maker сразу съел готовую строку
             parsed["admin_name"] = final_admin_display
             analysis_json = json.dumps(parsed, ensure_ascii=False)
 
@@ -155,6 +162,7 @@ def process_single_call(call: dict) -> str:
             logger.warning(f"Ошибка кастомизации JSON полей: {parse_err}")
 
         # Сохраняем успешный анализ звонка в БД
+        record_url = f"https://app.novofon.ru/system/media/talk/{call.get('communication_id', call_id)}/{record_id}/"
         save_analysis_to_db(
             call_key=call_key, call_id=call_id, record_id=record_id,
             start_time=call.get('start_time'), duration=talk_duration,
@@ -164,7 +172,7 @@ def process_single_call(call: dict) -> str:
             direction=direction
         )
 
-        # Создаём индивидуальный отчет (передаем время звонка и направление)
+        # Создаём индивидуальный отчет
         path_to_excel = create_call_report(
             gemini_json_str=analysis_json,
             call_id=call_id,
@@ -182,5 +190,5 @@ def process_single_call(call: dict) -> str:
         return "processed"
 
     except Exception as e:
-        logger.error(f"✗ Критическая ошибка обработки звонка {call.get('id')}: {e}", exc_info=True)
+        logger.error(f"❌ Ошибка при обработке звонка {call.get('id', 'unknown')}: {e}", exc_info=True)
         return "error"

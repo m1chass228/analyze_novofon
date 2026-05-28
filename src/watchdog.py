@@ -9,7 +9,7 @@ from src.database import (
     get_or_set_period_start, reset_period, get_success_calls_for_master
 )
 from src.api_client import get_calls
-from src.excel_maker import update_master_report, BASE_REPORTS_DIR
+from src.excel_maker import update_master_report, update_daily_report, BASE_REPORTS_DIR
 from src.call import process_single_call
 from src.sync_manager import YandexFolderSyncer
 
@@ -17,7 +17,7 @@ logger = setup_logger("watchdog")
 
 PERIOD_DAYS = 30
 PERIOD_SECONDS = PERIOD_DAYS * 24 * 3600
-CHECK_WINDOW_FIRST_RUN_HOURS = 4
+CHECK_WINDOW_FIRST_RUN_HOURS = 24
 CHECK_WINDOW_NORMAL_MINUTES = 20
 SLEEP_BETWEEN_CALLS = 8
 SLEEP_BETWEEN_CYCLES = 180
@@ -75,12 +75,23 @@ def watchdog():
                 # "error" — просто продолжаем
 
             if master_needs_update:
+                # Получаем все успешные звонки из базы данных
                 calls_for_report = get_success_calls_for_master()
+                
+                # 1. Обновляем глобальный Мастер-Отчет
                 master_path = update_master_report(calls_for_report)
                 if master_path:
-                    logger.info(f"| [MASTER EXCEL] Сводный отчет обновлён: {master_path}")
+                    logger.info(f"| [MASTER EXCEL] Сводный мастер-отчет обновлён: {master_path}")
                 
-                # === ФУЛЛ КОММИТ ПАПКИ REPORTS НА ДИСК ===
+                # 2. === НАШ НОВЫЙ ВЫЗОВ: Обновляем Ежедневный отчет за сегодня ===
+                try:
+                    daily_path = update_daily_report(calls_for_report)
+                    if daily_path:
+                        logger.info(f"| [DAILY EXCEL] Ежедневный отчет за сегодня создан/обновлен: {daily_path}")
+                except Exception as daily_err:
+                    logger.error(f"❌ Сбой при создании ежедневного отчета: {daily_err}", exc_info=True)
+                
+                # 3. === ФУЛЛ КОММИТ ПАПКИ REPORTS НА ДИСК (СИНКЛЕР) ===
                 try:
                     syncer = YandexFolderSyncer()
                     syncer.sync_reports()
