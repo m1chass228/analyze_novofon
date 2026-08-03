@@ -49,14 +49,8 @@ def setup_logger(name=__name__):
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(color_formatter)
     stdout_handler.setLevel(logging.DEBUG)
-    
-    # Запись в файл (теперь сюда летит ВЕСЬ ЖИР в цветах)
-    file_handler = logging.FileHandler("app.log", encoding="utf-8")
-    file_handler.setFormatter(color_formatter)
-    file_handler.setLevel(logging.DEBUG) # МЕНЯЕМ С INFO НА DEBUG!
 
     if not logger.handlers:
         logger.addHandler(stdout_handler)
-        logger.addHandler(file_handler)
         
     return logger
