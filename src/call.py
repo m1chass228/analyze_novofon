@@ -1,5 +1,3 @@
-
-
 import json
 import re
 
@@ -7,7 +5,7 @@ from utils.logs import setup_logger
 
 from src.api_client import get_record, analyze_audio
 from src.excel_maker import create_call_report
-from src.database import is_call_processed, save_analysis_to_db
+from src.database import is_call_processed, save_analysis_to_db, log_call_event, mark_call_appointment
 from utils.is_audio_empty import is_audio_empty
 
 import time
@@ -40,6 +38,8 @@ def process_single_call(call: dict) -> str:
         virtual_phone = str(call.get('virtual_phone_number') or call.get('did') or call.get('destination') or '').strip()
         # Очищаем от лишних символов, если они есть (например, +, пробелы, скобки)
         cleaned_virtual = re.sub(r'\D', '', virtual_phone)
+        # Внутренний номер Новофона (используется вместо ФИО в отчётах и для статистики)
+        internal_number = cleaned_virtual or UNKNOWN_VALUE
 
         # Подгружаем черный список номеров из конфига (по дефолту пустой список, если забыл указать)
         blocked_numbers = getattr(cfg, 'BLOCK_NUMBERS', [])
@@ -76,6 +76,23 @@ def process_single_call(call: dict) -> str:
 
         talk_duration = int(call.get('talk_duration') or call.get('duration') or 0)
         direction = call.get('direction', 'in')
+
+        # =====================================================================
+        # 📊 ЛОГ СОБЫТИЯ ДЛЯ СТАТИСТИКИ (пишем ВСЕ звонки, прошедшие черные списки —
+        # включая потерянные / короткие / без записи, чтобы отдельный файл статистики
+        # по внутренним номерам считался корректно)
+        # =====================================================================
+        try:
+            log_call_event(
+                call_id=call_id,
+                start_time=call.get('start_time'),
+                direction=direction,
+                internal_number=internal_number,
+                duration=talk_duration,
+                is_lost=call.get('is_lost', False)
+            )
+        except Exception as log_err:
+            logger.debug(f"Не удалось залогировать событие звонка {call_id} для статистики: {log_err}")
 
         if not record_id:
             logger.debug(f"○ Пропущен звонок {call_id}: нет record_id (нет записи разговора)")
@@ -116,67 +133,48 @@ def process_single_call(call: dict) -> str:
             )
             return "skipped"
 
-        # === Отправляем аудио на анализ диспетчеру (он сам решит: бесплатный GAS или платный fallback) ===
-        logger.info(f"⚡ Gemini анализ (попытка 1/3): {call_id}")
-        raw_response = analyze_audio(audio, call)
+        # === Отправляем аудио на анализ (с ретраями на случай нестабильности Gemini/GAS) ===
+        max_attempts = 3
+        attempt = 0
+        raw_response = None
+
+        while attempt < max_attempts:
+            try:
+                logger.info(f"⚡ Gemini анализ (попытка {attempt + 1}/{max_attempts}): {call_id}")
+                raw_response = analyze_audio(audio, call)
+                if raw_response:
+                    break
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка Gemini на попытке {attempt + 1}: {e}")
+
+            attempt += 1
+            if attempt < max_attempts:
+                time.sleep(5)  # Ждем перед повтором, если API штормит
 
         if not raw_response:
             logger.error(f"❌ Все попытки анализа звонка {call_id} завершились неудачей (вернулся None)")
             return "error"
 
-<<<<<<< Updated upstream
         # === ПАРСИНГ ОТВЕТА ===
         clinic_branch = UNKNOWN_VALUE
-        final_admin_display = admin_name
+        # Отображаем внутренний номер Новофона вместо ФИО администратора
+        final_admin_display = internal_number
         analysis_json = raw_response
-=======
-        logger.info(f"⚡ Анализируем через Gemini: {call_id}")
-        # === ДОБАВЛЯЕМ СЮДА ЦИКЛ ПОПЫТОК ДЛЯ СТАБИЛЬНОСТИ ===
-        max_attempts = 3
-        attempt = 0
-        analysis_json = None
-
-        while attempt < max_attempts:
-            try:
-                analysis_json = analyze_audio(audio, call)
-                if analysis_json:
-                    break  # Успешно получили ответ — выходим из цикла
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка Gemini на попытке {attempt+1}: {e}")
-            
-            attempt += 1
-            if attempt < max_attempts:
-                time.sleep(5) # Ждем перед повтором, если API штормит
->>>>>>> Stashed changes
+        appointment_made = False
 
         try:
             parsed = json.loads(raw_response)
-            
+
             # Извлекаем базовые поля отчета
             clinic_branch = parsed.get("clinic_branch")
-            if not clinic_branch or clinic_branch == "null": 
+            if not clinic_branch or clinic_branch == "null":
                 clinic_branch = UNKNOWN_VALUE
 
-            # === Красивая склейка имени администратора ===
-            # 1. Берем имя линии из Новофона (переменная admin_name из начала функции)
-            novofon_tube = admin_name.strip() if admin_name else ""
-            if novofon_tube in ["Не определен", "UNKNOWN_VALUE", "null", "None"]:
-                novofon_tube = ""
+            appointment_made = bool(parsed.get("appointment_made", False))
 
-            # 2. Вытаскиваем имя, которое нашла нейронка
-            gemini_admin = parsed.get("admin_name", "").strip()
-            if gemini_admin in ["Не представился(-ась)", "Не определен", "null", "None"]:
-                gemini_admin = ""
-
-            # 3. Скрепляем строго по формату: admin_full_name (имя вытащенное нейронкой)
-            if novofon_tube and gemini_admin:
-                final_admin_display = f"{novofon_tube} ({gemini_admin})"  # Оба есть -> "Marjino 120 (Анастасия)"
-            elif novofon_tube:
-                final_admin_display = novofon_tube                        # Только Новофон -> "Marjino 120"
-            elif gemini_admin:
-                final_admin_display = gemini_admin                        # Только нейронка -> "Анастасия"
-            else:
-                final_admin_display = "Не определен"                      # Если вообще пусто с обеих сторон (крайний случай)
+            # В отчётах (столбец "Администратор"/G) показываем внутренний номер Новофона,
+            # а не ФИО — так проще сопоставлять звонок с конкретной линией/сотрудником
+            final_admin_display = internal_number if internal_number != UNKNOWN_VALUE else UNKNOWN_VALUE
 
             # Перезаписываем в JSON, чтобы excel_maker сразу съел готовую строку
             parsed["admin_name"] = final_admin_display
@@ -184,6 +182,12 @@ def process_single_call(call: dict) -> str:
 
         except Exception as parse_err:
             logger.warning(f"Ошибка кастомизации JSON полей: {parse_err}")
+
+        # Обновляем флаг записи на приём в логе событий (для статистики "Запись"/"Конверсия")
+        try:
+            mark_call_appointment(call_id, appointment_made)
+        except Exception as mark_err:
+            logger.debug(f"Не удалось обновить appointment_made для {call_id} в логе событий: {mark_err}")
 
         # Сохраняем успешный анализ звонка в БД
         record_url = f"https://app.novofon.ru/system/media/talk/{call.get('communication_id', call_id)}/{record_id}/"
@@ -210,20 +214,19 @@ def process_single_call(call: dict) -> str:
         # === ИНТЕГРАЦИЯ ЯНДЕКС ДИСКА ===
         if path_to_excel:
             logger.info(f"| [EXCEL] Создан локально: {path_to_excel}")
-            
-        # Инициализируем загрузчик (токен лучше вынести в config)
+
+            # Инициализируем загрузчик (токен лучше вынести в config)
             from src.yandex_disk_uploader import YandexDiskUploader
             import config as cfg
-        
+
             uploader = YandexDiskUploader(token=cfg.YANDEX_TOKEN, remote_base_path="/NovofonReports")
-        
+
             # Загружаем индивидуальный отчет в подпапку 'individual'
             uploader.upload_file(path_to_excel, subfolder_name="individual")
 
-        if path_to_excel:
             logger.info(f"| [EXCEL] Создан индивидуальный отчёт: {path_to_excel}")
 
-        logger.info(f"✅ Успешно обработан: {call_id} | Админ: {final_admin_display} | Направление: {direction}")
+        logger.info(f"✅ Успешно обработан: {call_id} | Внутр. номер: {final_admin_display} | Направление: {direction}")
         return "processed"
 
     except Exception as e:
