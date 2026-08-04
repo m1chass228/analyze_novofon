@@ -1,17 +1,17 @@
-
-
 import time
 import os
 import shutil
+from datetime import datetime
 from utils.logs import setup_logger
 
 # Импортируем ВСЕ хелперы для БД в одном месте
 from src.database import (
     init_db, clear_old_data,
-    get_or_set_period_start, reset_period, get_success_calls_for_master
+    get_or_set_period_start, reset_period, get_success_calls_for_master,
+    get_call_events_for_date
 )
 from src.api_client import get_calls
-from src.excel_maker import update_master_report, update_daily_report, BASE_REPORTS_DIR
+from src.excel_maker import update_master_report, update_daily_report, create_statistics_report, BASE_REPORTS_DIR
 from src.call import process_single_call
 from src.sync_manager import YandexFolderSyncer
 
@@ -92,8 +92,18 @@ def watchdog():
                         logger.info(f"| [DAILY EXCEL] Ежедневный отчет за сегодня создан/обновлен: {daily_path}")
                 except Exception as daily_err:
                     logger.error(f"❌ Сбой при создании ежедневного отчета: {daily_err}", exc_info=True)
+
+                # 3. === ОТДЕЛЬНЫЙ ФАЙЛ СТАТИСТИКИ ПО ВНУТРЕННИМ НОМЕРАМ (по образцу формы) ===
+                try:
+                    today_str = datetime.now().strftime("%Y-%m-%d")
+                    events_today = get_call_events_for_date(today_str)
+                    stats_path = create_statistics_report(events_today, today_str)
+                    if stats_path:
+                        logger.info(f"| [STATS EXCEL] Статистика по внутренним номерам за {today_str} обновлена: {stats_path}")
+                except Exception as stats_err:
+                    logger.error(f"❌ Сбой при создании файла статистики: {stats_err}", exc_info=True)
                 
-                # 3. === ФУЛЛ КОММИТ ПАПКИ REPORTS НА ДИСК (СИНКЛЕР) ===
+                # 4. === ФУЛЛ КОММИТ ПАПКИ REPORTS НА ДИСК (СИНКЛЕР) ===
                 try:
                     syncer = YandexFolderSyncer()
                     syncer.sync_reports()

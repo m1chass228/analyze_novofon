@@ -1,4 +1,3 @@
-
 import os
 import logging
 import time
@@ -31,8 +30,8 @@ class YandexFolderSyncer:
             return False
 
     def _ensure_remote_structure(self):
-        # Добавили reports/daily в структуру удаленных папок
-        for path in ["reports", "reports/individual", "reports/daily"]:
+        # Добавили reports/daily и reports/statistics в структуру удаленных папок
+        for path in ["reports", "reports/individual", "reports/daily", "reports/statistics"]:
             try:
                 self.disk.mkdir(f"app:/{path}")
                 logger.debug(f"[SYNC] Создана удаленная папка: app:/{path}")
@@ -200,3 +199,17 @@ class YandexFolderSyncer:
                 logger.info(f"🚀 [SYNC] Ежедневный отчет {today_filename} обновлен в облаке! Ссылка: {daily_public_url}")
         except Exception as e:
             logger.error(f"❌ Ошибка синхронизации Ежедневного отчета: {e}")
+
+        # 7. Загрузка отдельного файла статистики по внутренним номерам за СЕГОДНЯ
+        logger.info("📊 [SYNC] Загрузка файла статистики по внутренним номерам в облако...")
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            stats_local_path = os.path.join(self.local_root, "statistics", f"stats_{today_str}.xlsx")
+            if os.path.exists(stats_local_path):
+                stats_remote_path = f"{self.remote_root}/statistics/stats_{today_str}.xlsx"
+                self.disk.upload(stats_local_path, stats_remote_path, overwrite=True)
+                self.disk.publish(stats_remote_path)
+                stats_public_url = self.disk.get_meta(stats_remote_path).public_url
+                logger.info(f"🚀 [SYNC] Статистика за {today_str} обновлена в облаке! Ссылка: {stats_public_url}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка синхронизации файла статистики: {e}")

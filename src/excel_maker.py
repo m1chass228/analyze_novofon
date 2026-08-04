@@ -1,7 +1,6 @@
-
-
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import json
 import os
 from datetime import datetime
@@ -71,8 +70,8 @@ def create_call_report(gemini_json_str: str, call_id: str, duration_sec: int, re
     category = int(data.get("category", 4))
 
     if score >= 37: fill_result = fill_cat_perfect
-    elif score >= 30: fill_result = fill_cat_good
-    elif score >= 23: fill_result = fill_cat_normal
+    elif score >= 28: fill_result = fill_cat_good
+    elif score >= 18: fill_result = fill_cat_normal
     else: fill_result = fill_cat_bad
 
     direction_readable = "Входящий" if direction == "in" else "Исходящий"
@@ -98,7 +97,7 @@ def create_call_report(gemini_json_str: str, call_id: str, duration_sec: int, re
         ("Направление звонка", direction_readable),
         ("Дата и время звонка", display_date),
         ("Длительность звонка", f"{duration_sec} сек (~{round(duration_sec/60, 1)} мин)"),
-        ("Администратор", ai_name),
+        ("Внутренний номер", ai_name),
         ("Итоговый балл", f"{score} / 43"),
         ("Категория качества", f"{category} категория")
     ]
@@ -290,7 +289,7 @@ def update_master_report(calls_data: list, public_urls_map: dict = None, *args, 
 
     headers = [
         "ID Звонка", "Дата", "Время", "Телефон клиента", "Длительность", "Итого балл (/43)", 
-        "Администратор", "Направление", "Запись", 
+        "Внутр. номер", "Направление", "Запись", 
         "Резюме диалога", "Детальный отчёт", "Запись звонка"
     ]
 
@@ -378,8 +377,8 @@ def update_master_report(calls_data: list, public_urls_map: dict = None, *args, 
         score_cell = ws.cell(row=current_row, column=6)
         score_cell.font = font_bold
         if total_score >= 37: score_cell.fill = fill_cat1
-        elif total_score >= 30: score_cell.fill = fill_cat2
-        elif total_score >= 23: score_cell.fill = fill_cat3
+        elif total_score >= 28: score_cell.fill = fill_cat2
+        elif total_score >= 18: score_cell.fill = fill_cat3
         else: score_cell.fill = fill_cat4
 
         # Подсветка записи (колонка 9)
@@ -494,7 +493,7 @@ def update_daily_report(calls_data: list, public_urls_map: dict = None) -> str |
 
     headers = [
         "ID Звонка", "Дата", "Время", "Телефон клиента", "Длительность", "Итого балл (/43)", 
-        "Администратор", "Направление", "Запись", 
+        "Внутр. номер", "Направление", "Запись", 
         "Резюме диалога", "Детальный отчёт", "Запись звонка"
     ]
 
@@ -589,8 +588,8 @@ def update_daily_report(calls_data: list, public_urls_map: dict = None) -> str |
         score_cell = ws.cell(row=current_row, column=6)
         score_cell.font = font_bold
         if total_score >= 37: score_cell.fill = fill_cat1
-        elif total_score >= 30: score_cell.fill = fill_cat2
-        elif total_score >= 23: score_cell.fill = fill_cat3
+        elif total_score >= 28: score_cell.fill = fill_cat2
+        elif total_score >= 18: score_cell.fill = fill_cat3
         else: score_cell.fill = fill_cat4
 
         # Подсветка записи
@@ -649,6 +648,227 @@ def update_daily_report(calls_data: list, public_urls_map: dict = None) -> str |
     }
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
+
+    wb.save(file_path)
+    return file_path
+
+
+# =========================================================================
+# ОТДЕЛЬНЫЙ ФАЙЛ СТАТИСТИКИ ПО ВНУТРЕННИМ НОМЕРАМ (по образцу присланной формы)
+# =========================================================================
+
+STATS_DIR = os.path.join(BASE_REPORTS_DIR, "statistics")
+
+STATS_GROUPS = [
+    {
+        "title": "ВСЕГО",
+        "numbers": {"101", "100", "107", "102", "110", "114", "109", "120", "121", "122", "106", "131", "130", "117"},
+        "time_range": None,
+        "metrics": ["total", "in", "out", "booked", "lost", "minutes"],
+    },
+    {
+        "title": "ЗВОНКИ админов и операторов",
+        "numbers": {"101", "100", "120", "121", "130", "131"},
+        "time_range": ("09:01", "21:59"),
+        "metrics": ["total", "in", "out", "booked", "lost", "conversion"],
+    },
+    {
+        "title": "ЗВОНКИ ночь Бирюлево",
+        "numbers": {"101", "100"},
+        "time_range": ("22:00", "09:00"),
+        "metrics": ["total", "in", "out", "booked", "lost", "conversion"],
+    },
+    {
+        "title": "ЗВОНКИ админов Бирюлево",
+        "numbers": {"101", "100"},
+        "time_range": ("09:01", "21:59"),
+        "metrics": ["total", "in", "out", "booked", "lost", "conversion"],
+    },
+    {
+        "title": "ЗВОНКИ админов Марьино",
+        "numbers": {"120", "121"},
+        "time_range": ("09:01", "21:59"),
+        "metrics": ["total", "in", "out", "booked", "lost", "conversion"],
+    },
+    {
+        "title": "Коломенское",
+        "numbers": {"130", "131"},
+        "time_range": ("09:01", "21:59"),
+        "metrics": ["total", "in", "out", "booked", "lost", "conversion"],
+    },
+    {
+        "title": "Стационар",
+        "numbers": {"114"},
+        "time_range": None,
+        "metrics": ["total", "in", "out", "lost"],
+    },
+    {
+        "title": "Оператор Раупова Индира",
+        "numbers": {"109"},
+        "time_range": None,
+        "metrics": ["total", "in", "out", "booked", "lost", "conversion"],
+    },
+    {
+        "title": "Оператор Татьяна Изосимова",
+        "numbers": {"106"},
+        "time_range": None,
+        "metrics": ["total", "in", "out", "booked", "lost", "conversion"],
+    },
+]
+
+METRIC_LABELS = {
+    "total": "Всего звонков",
+    "in": "Входящие",
+    "out": "Исходящие",
+    "booked": "Запись",
+    "lost": "Потерянные",
+    "minutes": "Кол-во минут",
+    "conversion": "Конверсия, %",
+}
+
+
+def _in_time_range(call_time, time_range):
+    """Проверяет, попадает ли время звонка в заданное окно (с поддержкой ночного окна через полночь)"""
+    if not time_range:
+        return True
+    start_t = datetime.strptime(time_range[0], "%H:%M").time()
+    end_t = datetime.strptime(time_range[1], "%H:%M").time()
+    if start_t <= end_t:
+        return start_t <= call_time <= end_t
+    return call_time >= start_t or call_time <= end_t
+
+
+def create_statistics_report(events: list, date_str: str = None, groups: list = None) -> str:
+    """
+    Строит отдельный файл ежедневной статистики звонков по внутренним номерам
+    (по образцу присланной формы: группы по филиалам/линиям/операторам, с разбивкой
+    Всего/Входящие/Исходящие/Запись/Потерянные/Конверсия, с учётом временных окон).
+
+    events — список кортежей (call_id, start_time, direction, internal_number,
+             duration, is_lost, appointment_made), например из get_call_events_for_date().
+    """
+    if groups is None:
+        groups = STATS_GROUPS
+
+    os.makedirs(STATS_DIR, exist_ok=True)
+
+    if not date_str:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+
+    file_path = os.path.join(STATS_DIR, f"stats_{date_str}.xlsx")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Статистика"
+    ws.views.sheetView[0].showGridLines = True
+
+    font_group_title = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+    font_header = Font(name="Segoe UI", size=9, bold=True, color="FFFFFF")
+    font_regular = Font(name="Segoe UI", size=10, color="2C3E50")
+    font_date = Font(name="Segoe UI", size=10, bold=True, color="2C3E50")
+
+    fill_group = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    fill_header = PatternFill(start_color="34495E", end_color="34495E", fill_type="solid")
+    fill_date_col = PatternFill(start_color="F8F9FA", end_color="F8F9FA", fill_type="solid")
+
+    align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    border_light = Border(left=Side(style="thin", color="D5D8DC"), right=Side(style="thin", color="D5D8DC"),
+                          top=Side(style="thin", color="D5D8DC"), bottom=Side(style="thin", color="D5D8DC"))
+
+    ws.cell(row=1, column=1, value="")
+    a2 = ws.cell(row=2, column=1, value="Дата")
+    a2.font = font_header
+    a2.fill = fill_header
+    a2.alignment = align_center
+    a2.border = border_light
+
+    col = 2
+    for group in groups:
+        start_col = col
+        for metric in group["metrics"]:
+            c = ws.cell(row=2, column=col, value=METRIC_LABELS.get(metric, metric))
+            c.font = font_header
+            c.fill = fill_header
+            c.alignment = align_center
+            c.border = border_light
+            col += 1
+        end_col = col - 1
+
+        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
+        gc = ws.cell(row=1, column=start_col, value=group["title"])
+        gc.font = font_group_title
+        gc.fill = fill_group
+        gc.alignment = align_center
+        for c_idx in range(start_col, end_col + 1):
+            ws.cell(row=1, column=c_idx).fill = fill_group
+            ws.cell(row=1, column=c_idx).border = border_light
+
+    ws.row_dimensions[1].height = 30
+    ws.row_dimensions[2].height = 30
+    ws.freeze_panes = "B3"
+
+    data_row = 3
+    ws.row_dimensions[data_row].height = 22
+
+    d_cell = ws.cell(row=data_row, column=1, value=date_str)
+    d_cell.font = font_date
+    d_cell.fill = fill_date_col
+    d_cell.alignment = align_center
+    d_cell.border = border_light
+
+    col = 2
+    for group in groups:
+        numbers = group["numbers"]
+        time_range = group["time_range"]
+
+        total = incoming = outgoing = booked = lost = 0
+        minutes_sum = 0.0
+
+        for row in events:
+            padded = list(row) + [None] * (7 - len(row))
+            _call_id, start_time, direction, internal_number, duration, is_lost, appointment_made = padded[:7]
+
+            if internal_number not in numbers:
+                continue
+            try:
+                dt = datetime.strptime(str(start_time).split(".")[0], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+            if not _in_time_range(dt.time(), time_range):
+                continue
+
+            total += 1
+            if direction == "in":
+                incoming += 1
+            else:
+                outgoing += 1
+            if is_lost:
+                lost += 1
+            if appointment_made:
+                booked += 1
+            minutes_sum += (duration or 0) / 60
+
+        values = {
+            "total": total,
+            "in": incoming,
+            "out": outgoing,
+            "booked": booked,
+            "lost": lost,
+            "minutes": round(minutes_sum, 1),
+            "conversion": round((booked / incoming * 100), 1) if incoming else 0,
+        }
+
+        for metric in group["metrics"]:
+            c = ws.cell(row=data_row, column=col, value=values[metric])
+            c.font = font_regular
+            c.alignment = align_center
+            c.border = border_light
+            col += 1
+
+    ws.column_dimensions['A'].width = 14
+    for c_idx in range(2, col):
+        ws.column_dimensions[get_column_letter(c_idx)].width = 12
 
     wb.save(file_path)
     return file_path
