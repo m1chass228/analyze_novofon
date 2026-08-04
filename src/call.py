@@ -217,7 +217,6 @@ def process_single_call(call: dict) -> str:
 
             # Инициализируем загрузчик (токен лучше вынести в config)
             from src.yandex_disk_uploader import YandexDiskUploader
-            import config as cfg
 
             uploader = YandexDiskUploader(token=cfg.YANDEX_TOKEN, remote_base_path="/NovofonReports")
 
