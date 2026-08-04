@@ -1,3 +1,4 @@
+
 import json
 import re
 
@@ -7,6 +8,8 @@ from src.api_client import get_record, analyze_audio
 from src.excel_maker import create_call_report
 from src.database import is_call_processed, save_analysis_to_db
 from utils.is_audio_empty import is_audio_empty
+
+import time
 
 import config as cfg
 
@@ -120,10 +123,30 @@ def process_single_call(call: dict) -> str:
             logger.error(f"❌ Все попытки анализа звонка {call_id} завершились неудачей (вернулся None)")
             return "error"
 
+<<<<<<< Updated upstream
         # === ПАРСИНГ ОТВЕТА ===
         clinic_branch = UNKNOWN_VALUE
         final_admin_display = admin_name
         analysis_json = raw_response
+=======
+        logger.info(f"⚡ Анализируем через Gemini: {call_id}")
+        # === ДОБАВЛЯЕМ СЮДА ЦИКЛ ПОПЫТОК ДЛЯ СТАБИЛЬНОСТИ ===
+        max_attempts = 3
+        attempt = 0
+        analysis_json = None
+
+        while attempt < max_attempts:
+            try:
+                analysis_json = analyze_audio(audio, call)
+                if analysis_json:
+                    break  # Успешно получили ответ — выходим из цикла
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка Gemini на попытке {attempt+1}: {e}")
+            
+            attempt += 1
+            if attempt < max_attempts:
+                time.sleep(5) # Ждем перед повтором, если API штормит
+>>>>>>> Stashed changes
 
         try:
             parsed = json.loads(raw_response)
@@ -182,6 +205,19 @@ def process_single_call(call: dict) -> str:
             call_start_time=call.get('start_time'),
             direction=direction
         )
+
+        # === ИНТЕГРАЦИЯ ЯНДЕКС ДИСКА ===
+        if path_to_excel:
+            logger.info(f"| [EXCEL] Создан локально: {path_to_excel}")
+            
+        # Инициализируем загрузчик (токен лучше вынести в config)
+            from src.yandex_disk_uploader import YandexDiskUploader
+            import config as cfg
+        
+            uploader = YandexDiskUploader(token=cfg.YANDEX_TOKEN, remote_base_path="/NovofonReports")
+        
+            # Загружаем индивидуальный отчет в подпапку 'individual'
+            uploader.upload_file(path_to_excel, subfolder_name="individual")
 
         if path_to_excel:
             logger.info(f"| [EXCEL] Создан индивидуальный отчёт: {path_to_excel}")
