@@ -38,8 +38,10 @@ def process_single_call(call: dict) -> str:
         virtual_phone = str(call.get('virtual_phone_number') or call.get('did') or call.get('destination') or '').strip()
         # Очищаем от лишних символов, если они есть (например, +, пробелы, скобки)
         cleaned_virtual = re.sub(r'\D', '', virtual_phone)
-        # Внутренний номер Новофона (используется вместо ФИО в отчётах и для статистики)
-        internal_number = cleaned_virtual or UNKNOWN_VALUE
+        # Внутренний номер Новофона (реальный добавочный сотрудника/линии — используется
+        # вместо ФИО в отчётах и для статистики). Извлекается в api_client.get_calls()
+        # из employee_full_name (напр. "Иванова Анастасия - 120" -> "120")
+        internal_number = str(call.get('internal_number') or '').strip() or UNKNOWN_VALUE
 
         # Подгружаем черный список номеров из конфига (по дефолту пустой список, если забыл указать)
         blocked_numbers = getattr(cfg, 'BLOCK_NUMBERS', [])

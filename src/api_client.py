@@ -165,20 +165,27 @@ def get_calls(hours_back: int = 24):
             
             talk_duration = int(call.get("talk_duration") or call.get("duration") or 0)
             
-            admin_name = UNKNOWN_VALUE
+            raw_admin_name = None
             if call.get("last_answered_employee_full_name"):
-                admin_name = call.get("last_answered_employee_full_name").strip()
+                raw_admin_name = call.get("last_answered_employee_full_name").strip()
             elif call.get("first_answered_employee_full_name"):
-                admin_name = call.get("first_answered_employee_full_name").strip()
-            
-            if admin_name == UNKNOWN_VALUE:
+                raw_admin_name = call.get("first_answered_employee_full_name").strip()
+
+            if not raw_admin_name:
                 for emp in (call.get("employees") or []):
                     if isinstance(emp, dict) and emp.get("employee_full_name"):
-                        admin_name = emp.get("employee_full_name").strip()
+                        raw_admin_name = emp.get("employee_full_name").strip()
                         break
-            
-            if admin_name != UNKNOWN_VALUE:
-                admin_name = re.sub(r'\s*-\s*\d+.*$', '', admin_name).strip()
+
+            admin_name = UNKNOWN_VALUE
+            internal_number = ""
+            if raw_admin_name:
+                # Внутренний номер обычно идёт в конце ФИО/названия линии, напр.
+                # "Иванова Анастасия - 120" или "Marjino 120" -> вытаскиваем "120"
+                m = re.search(r'(\d{2,4})\s*$', raw_admin_name)
+                if m:
+                    internal_number = m.group(1)
+                admin_name = re.sub(r'\s*-?\s*\d{2,4}\s*$', '', raw_admin_name).strip() or UNKNOWN_VALUE
 
             call_records = call.get("call_records") or []
             wav_records = call.get("wav_call_records") or []
@@ -192,6 +199,7 @@ def get_calls(hours_back: int = 24):
                 "phone": call.get("contact_phone_number"),
                 "virtual_phone_number": call.get("virtual_phone_number"),
                 "admin_name": admin_name,
+                "internal_number": internal_number,
                 "is_lost": call.get("is_lost", False),
                 "direction": call.get("direction"),
                 "call_records": records_to_use
