@@ -171,21 +171,53 @@ def get_calls(hours_back: int = 24):
             elif call.get("first_answered_employee_full_name"):
                 raw_admin_name = call.get("first_answered_employee_full_name").strip()
 
+            employees_list = call.get("employees") or []
             if not raw_admin_name:
-                for emp in (call.get("employees") or []):
+                for emp in employees_list:
                     if isinstance(emp, dict) and emp.get("employee_full_name"):
                         raw_admin_name = emp.get("employee_full_name").strip()
                         break
 
-            admin_name = UNKNOWN_VALUE
+            # === Внутренний номер (добавочный) ===
+            # 1) В приоритете — официальное поле Новофона extension_phone_number
+            #    (может быть на верхнем уровне звонка, в employees[], или в last/first_answered_*)
             internal_number = ""
+            for key in ("last_answered_employee_extension_phone_number",
+                        "first_answered_employee_extension_phone_number",
+                        "extension_phone_number"):
+                val = call.get(key)
+                if val:
+                    internal_number = re.sub(r'\D', '', str(val))
+                    break
+
+            if not internal_number:
+                for emp in employees_list:
+                    if isinstance(emp, dict) and emp.get("extension_phone_number"):
+                        internal_number = re.sub(r'\D', '', str(emp.get("extension_phone_number")))
+                        break
+
+            admin_name = UNKNOWN_VALUE
             if raw_admin_name:
-                # Внутренний номер обычно идёт в конце ФИО/названия линии, напр.
-                # "Иванова Анастасия - 120" или "Marjino 120" -> вытаскиваем "120"
-                m = re.search(r'(\d{2,4})\s*$', raw_admin_name)
-                if m:
-                    internal_number = m.group(1)
+                # 2) Фолбэк: если официального поля не нашлось — пытаемся вытащить
+                #    ровно трёхзначный добавочный из конца строки ФИО/линии
+                #    (напр. "Иванова Анастасия - 120" -> "120")
+                if not internal_number:
+                    m = re.search(r'(\d{3})\s*$', raw_admin_name)
+                    if m:
+                        internal_number = m.group(1)
                 admin_name = re.sub(r'\s*-?\s*\d{2,4}\s*$', '', raw_admin_name).strip() or UNKNOWN_VALUE
+
+            if not internal_number:
+                logger.debug(
+                    f"[INTERNAL_NUMBER] Не удалось определить внутренний номер для звонка "
+                    f"{call.get('id')}: raw_admin_name={raw_admin_name!r}, "
+                    f"employees={employees_list}"
+                )
+            elif call is data[0]:
+                logger.info(
+                    f"[DEBUG_INTERNAL_NUMBER] Пример извлечения: raw_admin_name={raw_admin_name!r} "
+                    f"-> admin_name={admin_name!r}, internal_number={internal_number!r}"
+                )
 
             call_records = call.get("call_records") or []
             wav_records = call.get("wav_call_records") or []
