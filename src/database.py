@@ -166,6 +166,24 @@ def get_call_events_for_date(date_str: str) -> list:
         return []
 
 
+def get_all_call_events() -> list:
+    """Возвращает ВСЕ 'сырые' события звонков за всё время (для накопительного файла статистики)"""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT call_id, start_time, direction, internal_number, duration, is_lost, appointment_made
+            FROM call_events
+            ORDER BY start_time DESC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.error(f"[DB] get_all_call_events failed: {e}")
+        return []
+
+
 def is_call_processed(call_key: str) -> bool:
     """Проверяет, обработан ли уже этот звонок"""
     try:

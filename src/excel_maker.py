@@ -657,8 +657,6 @@ def update_daily_report(calls_data: list, public_urls_map: dict = None) -> str |
 # ОТДЕЛЬНЫЙ ФАЙЛ СТАТИСТИКИ ПО ВНУТРЕННИМ НОМЕРАМ (по образцу присланной формы)
 # =========================================================================
 
-STATS_DIR = os.path.join(BASE_REPORTS_DIR, "statistics")
-
 STATS_GROUPS = [
     {
         "title": "ВСЕГО",
@@ -738,29 +736,77 @@ def _in_time_range(call_time, time_range):
     return call_time >= start_t or call_time <= end_t
 
 
-def create_statistics_report(events: list, date_str: str = None, groups: list = None) -> str:
-    """
-    Строит отдельный файл ежедневной статистики звонков по внутренним номерам
-    (по образцу присланной формы: группы по филиалам/линиям/операторам, с разбивкой
-    Всего/Входящие/Исходящие/Запись/Потерянные/Конверсия, с учётом временных окон).
+def _compute_group_values(events_for_date: list, group: dict) -> dict:
+    """Считает метрики одной группы по событиям одной даты"""
+    numbers = group["numbers"]
+    time_range = group["time_range"]
 
-    events — список кортежей (call_id, start_time, direction, internal_number,
-             duration, is_lost, appointment_made), например из get_call_events_for_date().
+    total = incoming = outgoing = booked = lost = 0
+    minutes_sum = 0.0
+
+    for row in events_for_date:
+        padded = list(row) + [None] * (7 - len(row))
+        _call_id, start_time, direction, internal_number, duration, is_lost, appointment_made = padded[:7]
+
+        if internal_number not in numbers:
+            continue
+        try:
+            dt = datetime.strptime(str(start_time).split(".")[0], "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        if not _in_time_range(dt.time(), time_range):
+            continue
+
+        total += 1
+        if direction == "in":
+            incoming += 1
+        else:
+            outgoing += 1
+        if is_lost:
+            lost += 1
+        if appointment_made:
+            booked += 1
+        minutes_sum += (duration or 0) / 60
+
+    return {
+        "total": total,
+        "in": incoming,
+        "out": outgoing,
+        "booked": booked,
+        "lost": lost,
+        "minutes": round(minutes_sum, 1),
+        "conversion": round((booked / incoming * 100), 1) if incoming else 0,
+    }
+
+
+def update_statistics_report(all_events: list, groups: list = None) -> str:
+    """
+    Строит ЕДИНЫЙ накопительный файл статистики по внутренним номерам — по одной
+    строке на каждую дату, полностью пересобирается при каждом вызове (как
+    update_master_report). Лежит на уровне мастер-отчёта, без подпапки.
+
+    all_events — ВСЕ события звонков за всё время из БД (call_id, start_time,
+                 direction, internal_number, duration, is_lost, appointment_made).
     """
     if groups is None:
         groups = STATS_GROUPS
 
-    os.makedirs(STATS_DIR, exist_ok=True)
+    init_report_structure()
+    file_path = os.path.join(BASE_REPORTS_DIR, "statistics_report.xlsx")
 
-    if not date_str:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+    # Группируем события по дате (YYYY-MM-DD, вытащенной из start_time)
+    events_by_date = {}
+    for row in all_events:
+        padded = list(row) + [None] * (7 - len(row))
+        start_time = padded[1]
+        date_key = str(start_time).split(" ")[0].split("T")[0] if start_time else "Не определена"
+        events_by_date.setdefault(date_key, []).append(row)
 
-    file_path = os.path.join(STATS_DIR, f"stats_{date_str}.xlsx")
+    dates_sorted = sorted(events_by_date.keys(), reverse=True)
 
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Статистика"
-    ws.views.sheetView[0].showGridLines = True
 
     font_group_title = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
     font_header = Font(name="Segoe UI", size=9, bold=True, color="FFFFFF")
@@ -772,11 +818,10 @@ def create_statistics_report(events: list, date_str: str = None, groups: list = 
     fill_date_col = PatternFill(start_color="F8F9FA", end_color="F8F9FA", fill_type="solid")
 
     align_center = Alignment(horizontal="center", vertical="center", wrap_text=True)
-
     border_light = Border(left=Side(style="thin", color="D5D8DC"), right=Side(style="thin", color="D5D8DC"),
                           top=Side(style="thin", color="D5D8DC"), bottom=Side(style="thin", color="D5D8DC"))
 
-    ws.cell(row=1, column=1, value="")
+    # === Заголовки: строка 1 — группы (объединённые), строка 2 — метрики ===
     a2 = ws.cell(row=2, column=1, value="Дата")
     a2.font = font_header
     a2.fill = fill_header
@@ -808,66 +853,33 @@ def create_statistics_report(events: list, date_str: str = None, groups: list = 
     ws.row_dimensions[2].height = 30
     ws.freeze_panes = "B3"
 
+    # === Данные: по одной строке на каждую дату, от новых к старым ===
     data_row = 3
-    ws.row_dimensions[data_row].height = 22
+    for date_key in dates_sorted:
+        events_for_date = events_by_date[date_key]
+        ws.row_dimensions[data_row].height = 20
 
-    d_cell = ws.cell(row=data_row, column=1, value=date_str)
-    d_cell.font = font_date
-    d_cell.fill = fill_date_col
-    d_cell.alignment = align_center
-    d_cell.border = border_light
+        d_cell = ws.cell(row=data_row, column=1, value=date_key)
+        d_cell.font = font_date
+        d_cell.fill = fill_date_col
+        d_cell.alignment = align_center
+        d_cell.border = border_light
 
-    col = 2
-    for group in groups:
-        numbers = group["numbers"]
-        time_range = group["time_range"]
+        col = 2
+        for group in groups:
+            values = _compute_group_values(events_for_date, group)
+            for metric in group["metrics"]:
+                c = ws.cell(row=data_row, column=col, value=values[metric])
+                c.font = font_regular
+                c.alignment = align_center
+                c.border = border_light
+                col += 1
 
-        total = incoming = outgoing = booked = lost = 0
-        minutes_sum = 0.0
+        data_row += 1
 
-        for row in events:
-            padded = list(row) + [None] * (7 - len(row))
-            _call_id, start_time, direction, internal_number, duration, is_lost, appointment_made = padded[:7]
-
-            if internal_number not in numbers:
-                continue
-            try:
-                dt = datetime.strptime(str(start_time).split(".")[0], "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                continue
-            if not _in_time_range(dt.time(), time_range):
-                continue
-
-            total += 1
-            if direction == "in":
-                incoming += 1
-            else:
-                outgoing += 1
-            if is_lost:
-                lost += 1
-            if appointment_made:
-                booked += 1
-            minutes_sum += (duration or 0) / 60
-
-        values = {
-            "total": total,
-            "in": incoming,
-            "out": outgoing,
-            "booked": booked,
-            "lost": lost,
-            "minutes": round(minutes_sum, 1),
-            "conversion": round((booked / incoming * 100), 1) if incoming else 0,
-        }
-
-        for metric in group["metrics"]:
-            c = ws.cell(row=data_row, column=col, value=values[metric])
-            c.font = font_regular
-            c.alignment = align_center
-            c.border = border_light
-            col += 1
-
+    last_col = col if dates_sorted else 2
     ws.column_dimensions['A'].width = 14
-    for c_idx in range(2, col):
+    for c_idx in range(2, last_col):
         ws.column_dimensions[get_column_letter(c_idx)].width = 12
 
     wb.save(file_path)
