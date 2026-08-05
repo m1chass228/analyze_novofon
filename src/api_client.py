@@ -32,6 +32,16 @@ except AttributeError:
 
 UNKNOWN_VALUE = "Не определен"
 
+# Ручное сопоставление имени линии/сотрудника -> внутренний номер, для случаев,
+# когда Новофон вообще не пишет цифры в employee_full_name (напр. "Татьяна Изосимова").
+# Взято из присланной формы статистики. Ключи регистронезависимы.
+# Можно дополнить/переопределить через cfg.EMPLOYEE_NAME_TO_NUMBER в config.py —
+# особенно для "AdminKolomenskoe" и "Admin_trubka", у которых номер сейчас неизвестен.
+DEFAULT_EMPLOYEE_NAME_TO_NUMBER = {
+    "татьяна изосимова": "106",
+    "раупова индира": "109",
+}
+
 logger = setup_logger("analyzer")
 
 # === КАСТОМНЫЕ ИСКЛЮЧЕНИЯ ДЛЯ УПРАВЛЕНИЯ ЦИКЛАМИ RETRY ===
@@ -178,45 +188,57 @@ def get_calls(hours_back: int = 24):
                         raw_admin_name = emp.get("employee_full_name").strip()
                         break
 
-            # === Внутренний номер (добавочный) ===
-            # 1) В приоритете — официальное поле Новофона extension_phone_number
-            #    (может быть на верхнем уровне звонка, в employees[], или в last/first_answered_*)
-            internal_number = ""
+            # === Внутренний номер для ОТЧЁТОВ (столбец G) — пишем как прислал Новофон,
+            # без парсинга: "103 Povodok", "114 Stacionar", "Татьяна Изосимова",
+            # "AdminKolomenskoe" и т.д. Если линии вообще нет — "Не определен".
+            internal_number = raw_admin_name.strip() if raw_admin_name else UNKNOWN_VALUE
+            admin_name = internal_number
+
+            # === Отдельно — чистое число для ГРУППИРОВКИ в файле статистики
+            # (STATS_GROUPS сравнивает по числам типа "101", "120" и т.д.) ===
+            stats_number = ""
             for key in ("last_answered_employee_extension_phone_number",
                         "first_answered_employee_extension_phone_number",
                         "extension_phone_number"):
                 val = call.get(key)
                 if val:
-                    internal_number = re.sub(r'\D', '', str(val))
+                    stats_number = re.sub(r'\D', '', str(val))
                     break
 
-            if not internal_number:
+            if not stats_number:
                 for emp in employees_list:
                     if isinstance(emp, dict) and emp.get("extension_phone_number"):
-                        internal_number = re.sub(r'\D', '', str(emp.get("extension_phone_number")))
+                        stats_number = re.sub(r'\D', '', str(emp.get("extension_phone_number")))
                         break
 
-            admin_name = UNKNOWN_VALUE
-            if raw_admin_name:
-                # 2) Фолбэк: если официального поля не нашлось — пытаемся вытащить
-                #    ровно трёхзначный добавочный из конца строки ФИО/линии
-                #    (напр. "Иванова Анастасия - 120" -> "120")
-                if not internal_number:
-                    m = re.search(r'(\d{3})\s*$', raw_admin_name)
-                    if m:
-                        internal_number = m.group(1)
-                admin_name = re.sub(r'\s*-?\s*\d{2,4}\s*$', '', raw_admin_name).strip() or UNKNOWN_VALUE
+            if not stats_number and raw_admin_name:
+                # Номер встречается либо в начале ("103 Povodok"), либо в конце
+                # ("Иванова Анастасия - 120") строки от Новофона
+                m = re.match(r'^(\d{2,4})\b', raw_admin_name) or re.search(r'\b(\d{2,4})\s*$', raw_admin_name)
+                if m:
+                    stats_number = m.group(1)
 
-            if not internal_number:
+            if not stats_number and raw_admin_name:
+                # Если цифр в названии линии нет вообще (напр. "Татьяна Изосимова",
+                # "AdminKolomenskoe", "Admin_trubka") — берём из ручной таблицы
+                # соответствий. Дополнить/поправить можно через cfg.EMPLOYEE_NAME_TO_NUMBER
+                # в config.py (ключи регистронезависимы).
+                name_key = re.sub(r'\s+', ' ', raw_admin_name).strip().lower()
+                name_map = {**DEFAULT_EMPLOYEE_NAME_TO_NUMBER}
+                for k, v in (getattr(cfg, 'EMPLOYEE_NAME_TO_NUMBER', {}) or {}).items():
+                    name_map[str(k).strip().lower()] = str(v)
+                stats_number = name_map.get(name_key, "")
+
+            if not stats_number:
                 logger.debug(
-                    f"[INTERNAL_NUMBER] Не удалось определить внутренний номер для звонка "
+                    f"[INTERNAL_NUMBER] Не удалось определить номер для статистики звонка "
                     f"{call.get('id')}: raw_admin_name={raw_admin_name!r}, "
                     f"employees={employees_list}"
                 )
             elif call is data[0]:
                 logger.info(
-                    f"[DEBUG_INTERNAL_NUMBER] Пример извлечения: raw_admin_name={raw_admin_name!r} "
-                    f"-> admin_name={admin_name!r}, internal_number={internal_number!r}"
+                    f"[DEBUG_INTERNAL_NUMBER] Пример: raw_admin_name={raw_admin_name!r} "
+                    f"-> internal_number(для отчёта)={internal_number!r}, stats_number(для статистики)={stats_number!r}"
                 )
 
             call_records = call.get("call_records") or []
@@ -232,6 +254,7 @@ def get_calls(hours_back: int = 24):
                 "virtual_phone_number": call.get("virtual_phone_number"),
                 "admin_name": admin_name,
                 "internal_number": internal_number,
+                "stats_number": stats_number,
                 "is_lost": call.get("is_lost", False),
                 "direction": call.get("direction"),
                 "call_records": records_to_use

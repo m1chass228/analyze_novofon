@@ -41,7 +41,11 @@ def process_single_call(call: dict) -> str:
         # Внутренний номер Новофона (реальный добавочный сотрудника/линии — используется
         # вместо ФИО в отчётах и для статистики). Извлекается в api_client.get_calls()
         # из employee_full_name (напр. "Иванова Анастасия - 120" -> "120")
+        # Внутренний номер Новофона — для ОТЧЁТОВ (столбец G) пишем как есть, без парсинга:
+        # "103 Povodok", "AdminKolomenskoe", "Татьяна Изосимова" и т.д.
         internal_number = str(call.get('internal_number') or '').strip() or UNKNOWN_VALUE
+        # Отдельно — чистое число для группировки в файле статистики (STATS_GROUPS)
+        stats_number = str(call.get('stats_number') or '').strip()
 
         # Подгружаем черный список номеров из конфига (по дефолту пустой список, если забыл указать)
         blocked_numbers = getattr(cfg, 'BLOCK_NUMBERS', [])
@@ -89,7 +93,7 @@ def process_single_call(call: dict) -> str:
                 call_id=call_id,
                 start_time=call.get('start_time'),
                 direction=direction,
-                internal_number=internal_number,
+                internal_number=stats_number,
                 duration=talk_duration,
                 is_lost=call.get('is_lost', False)
             )
