@@ -1,9 +1,11 @@
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.chart.label import DataLabelList
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Базовые пути для хранения отчетов
 BASE_REPORTS_DIR = "reports"
@@ -736,6 +738,17 @@ def _in_time_range(call_time, time_range):
     return call_time >= start_t or call_time <= end_t
 
 
+def _group_events_by_date(all_events: list) -> dict:
+    """Группирует события звонков по дате (YYYY-MM-DD, вытащенной из start_time)"""
+    events_by_date = {}
+    for row in all_events:
+        padded = list(row) + [None] * (7 - len(row))
+        start_time = padded[1]
+        date_key = str(start_time).split(" ")[0].split("T")[0] if start_time else "Не определена"
+        events_by_date.setdefault(date_key, []).append(row)
+    return events_by_date
+
+
 def _compute_group_values(events_for_date: list, group: dict) -> dict:
     """Считает метрики одной группы по событиям одной даты"""
     numbers = group["numbers"]
@@ -795,12 +808,7 @@ def update_statistics_report(all_events: list, groups: list = None) -> str:
     file_path = os.path.join(BASE_REPORTS_DIR, "statistics_report.xlsx")
 
     # Группируем события по дате (YYYY-MM-DD, вытащенной из start_time)
-    events_by_date = {}
-    for row in all_events:
-        padded = list(row) + [None] * (7 - len(row))
-        start_time = padded[1]
-        date_key = str(start_time).split(" ")[0].split("T")[0] if start_time else "Не определена"
-        events_by_date.setdefault(date_key, []).append(row)
+    events_by_date = _group_events_by_date(all_events)
 
     dates_sorted = sorted(events_by_date.keys(), reverse=True)
 
@@ -881,6 +889,269 @@ def update_statistics_report(all_events: list, groups: list = None) -> str:
     ws.column_dimensions['A'].width = 14
     for c_idx in range(2, last_col):
         ws.column_dimensions[get_column_letter(c_idx)].width = 12
+
+    wb.save(file_path)
+    return file_path
+
+
+# =========================================================================
+# ДАШБОРД — сводная витрина с графиками и ссылками на остальные отчёты.
+# Лежит на уровне мастер-отчёта (reports/dashboard.xlsx), пересобирается
+# полностью при каждом вызове, как master/statistics.
+# =========================================================================
+
+DASHBOARD_LOOKBACK_DAYS = 14  # сколько последних дней показываем на графиках трендов
+
+
+def _parse_total_score(analysis_text: str):
+    """Достаёт total_score из JSON анализа звонка, если получится"""
+    try:
+        parsed = json.loads(analysis_text) if analysis_text else {}
+        score = parsed.get("total_score")
+        return float(score) if score is not None else None
+    except Exception:
+        return None
+
+
+def create_dashboard(all_events: list, success_calls: list, links: dict = None) -> str:
+    """
+    Строит дашборд reports/dashboard.xlsx: KPI-плашки, графики и ссылки на остальные
+    отчёты.
+
+    all_events    — все события звонков из get_all_call_events()
+                     (call_id, start_time, direction, internal_number, duration, is_lost, appointment_made)
+    success_calls — успешные звонки из get_success_calls_for_master()
+                     (start_time, call_id, duration, phone, admin_name, clinic_branch,
+                      analysis_text, record_url, direction, report_url)
+    links         — необязательный dict {название: URL/путь} для блока ссылок,
+                     например {"Мастер-отчёт": "master_calls_report.xlsx", ...}
+    """
+    init_report_structure()
+    file_path = os.path.join(BASE_REPORTS_DIR, "dashboard.xlsx")
+
+    if links is None:
+        links = {
+            "📊 Мастер-отчёт (все звонки)": "master_calls_report.xlsx",
+            "📅 Ежедневный отчёт (сегодня)": f"daily/{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+            "📈 Статистика по внутренним номерам": "statistics_report.xlsx",
+        }
+
+    font_h1 = Font(name="Segoe UI", size=16, bold=True, color="2C3E50")
+    font_h2 = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+    font_kpi_value = Font(name="Segoe UI", size=20, bold=True, color="FFFFFF")
+    font_kpi_label = Font(name="Segoe UI", size=9, color="FFFFFF")
+    font_link = Font(name="Segoe UI", size=10, color="2E75B6", underline="single")
+    font_muted = Font(name="Segoe UI", size=9, italic=True, color="7F8C8D")
+
+    fill_kpi_1 = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    fill_kpi_2 = PatternFill(start_color="27AE60", end_color="27AE60", fill_type="solid")
+    fill_kpi_3 = PatternFill(start_color="2E86C1", end_color="2E86C1", fill_type="solid")
+    fill_kpi_4 = PatternFill(start_color="C0392B", end_color="C0392B", fill_type="solid")
+    fill_section = PatternFill(start_color="34495E", end_color="34495E", fill_type="solid")
+
+    align_center = Alignment(horizontal="center", vertical="center")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Дашборд"
+    ws.sheet_view.showGridLines = False
+
+    # === Заголовок ===
+    ws.merge_cells("A1:H1")
+    title_cell = ws["A1"]
+    title_cell.value = "📋 Дашборд по звонкам клиники"
+    title_cell.font = font_h1
+    ws.row_dimensions[1].height = 28
+
+    ws["A2"] = f"Обновлено: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    ws["A2"].font = font_muted
+
+    # === Блок ссылок на остальные отчёты (строка 3) ===
+    link_col = 1
+    for label, target in links.items():
+        c = ws.cell(row=3, column=link_col, value=label)
+        c.font = font_link
+        c.hyperlink = target
+        link_col += 2
+    ws.row_dimensions[3].height = 18
+
+    # === Считаем данные ===
+    events_by_date = _group_events_by_date(all_events)
+    all_numbers = STATS_GROUPS[0]["numbers"]  # набор "внешних" номеров (группа "ВСЕГО")
+
+    today = datetime.now().date()
+    dates_window = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(DASHBOARD_LOOKBACK_DAYS - 1, -1, -1)]
+
+    trend_rows = []  # (дата, всего, входящие, исходящие, потерянные, запись, конверсия%)
+    for date_key in dates_window:
+        events_for_date = events_by_date.get(date_key, [])
+        vals = _compute_group_values(events_for_date, {"numbers": all_numbers, "time_range": None})
+        trend_rows.append((date_key, vals["total"], vals["in"], vals["out"], vals["lost"], vals["booked"], vals["conversion"]))
+
+    total_calls_period = sum(r[1] for r in trend_rows)
+    total_lost_period = sum(r[4] for r in trend_rows)
+    total_booked_period = sum(r[5] for r in trend_rows)
+    total_in_period = sum(r[2] for r in trend_rows)
+    avg_conversion = round((total_booked_period / total_in_period * 100), 1) if total_in_period else 0
+
+    # Звонки по группам за сегодня (для столбчатой диаграммы по линиям)
+    events_today = events_by_date.get(today.strftime("%Y-%m-%d"), [])
+    group_bar_rows = []
+    for group in STATS_GROUPS[1:]:  # без "ВСЕГО" — она агрегирующая
+        vals = _compute_group_values(events_today, group)
+        group_bar_rows.append((group["title"], vals["total"]))
+
+    # Средний балл оценки по линиям (из success_calls)
+    scores_by_line = {}
+    for row in success_calls:
+        padded = list(row) + [None] * (10 - len(row))
+        admin_name, analysis_text = padded[4], padded[6]
+        score = _parse_total_score(analysis_text)
+        if score is None or not admin_name:
+            continue
+        scores_by_line.setdefault(admin_name, []).append(score)
+
+    avg_scores = sorted(
+        [(name, round(sum(v) / len(v), 1), len(v)) for name, v in scores_by_line.items()],
+        key=lambda x: x[1]
+    )
+
+    # === KPI-плашки (строки 5-7) ===
+    kpi_row = 5
+    kpis = [
+        ("Всего звонков", str(total_calls_period), fill_kpi_1),
+        ("Конверсия в запись", f"{avg_conversion}%", fill_kpi_2),
+        ("Потерянные", str(total_lost_period), fill_kpi_4),
+        ("Записей создано", str(total_booked_period), fill_kpi_3),
+    ]
+    kpi_col = 1
+    for label, value, fill in kpis:
+        ws.merge_cells(start_row=kpi_row, start_column=kpi_col, end_row=kpi_row, end_column=kpi_col + 1)
+        vcell = ws.cell(row=kpi_row, column=kpi_col, value=value)
+        vcell.font = font_kpi_value
+        vcell.fill = fill
+        vcell.alignment = align_center
+        ws.cell(row=kpi_row, column=kpi_col + 1).fill = fill
+
+        ws.merge_cells(start_row=kpi_row + 1, start_column=kpi_col, end_row=kpi_row + 1, end_column=kpi_col + 1)
+        lcell = ws.cell(row=kpi_row + 1, column=kpi_col, value=label)
+        lcell.font = font_kpi_label
+        lcell.fill = fill
+        lcell.alignment = Alignment(horizontal="center", vertical="bottom")
+        ws.cell(row=kpi_row + 1, column=kpi_col + 1).fill = fill
+
+        kpi_col += 2
+    ws.row_dimensions[kpi_row].height = 30
+    ws.row_dimensions[kpi_row + 1].height = 16
+    ws.freeze_panes = "A4"
+    ws["A4"] = f"За последние {DASHBOARD_LOOKBACK_DAYS} дней"
+    ws["A4"].font = font_muted
+
+    # === Скрытая область данных для графиков (лист "Данные") ===
+    data_ws = wb.create_sheet("Данные")
+    data_ws.sheet_state = "hidden"
+
+    # -- Тренд по дням --
+    data_ws.append(["Дата", "Всего", "Входящие", "Исходящие", "Потерянные", "Запись", "Конверсия %"])
+    for row in trend_rows:
+        data_ws.append(list(row))
+    trend_last_row = 1 + len(trend_rows)
+
+    # -- Звонки по группам сегодня --
+    group_start_row = trend_last_row + 3
+    data_ws.cell(row=group_start_row, column=1, value="Группа")
+    data_ws.cell(row=group_start_row, column=2, value="Звонков")
+    for i, (name, total) in enumerate(group_bar_rows, start=1):
+        data_ws.cell(row=group_start_row + i, column=1, value=name)
+        data_ws.cell(row=group_start_row + i, column=2, value=total)
+    group_last_row = group_start_row + len(group_bar_rows)
+
+    # -- Направление (сегодня, все номера) --
+    direction_start_row = group_last_row + 3
+    total_in_today = sum(1 for r in events_today if (list(r) + [None] * 7)[2] == "in")
+    total_out_today = sum(1 for r in events_today if (list(r) + [None] * 7)[2] != "in")
+    data_ws.cell(row=direction_start_row, column=1, value="Направление")
+    data_ws.cell(row=direction_start_row, column=2, value="Звонков")
+    data_ws.cell(row=direction_start_row + 1, column=1, value="Входящие")
+    data_ws.cell(row=direction_start_row + 1, column=2, value=total_in_today)
+    data_ws.cell(row=direction_start_row + 2, column=1, value="Исходящие")
+    data_ws.cell(row=direction_start_row + 2, column=2, value=total_out_today)
+    direction_last_row = direction_start_row + 2
+
+    # -- Средний балл по линиям (снизу вверх — худшие сверху для наглядности) --
+    scores_start_row = direction_last_row + 3
+    data_ws.cell(row=scores_start_row, column=1, value="Линия")
+    data_ws.cell(row=scores_start_row, column=2, value="Средний балл")
+    for i, (name, avg, cnt) in enumerate(avg_scores, start=1):
+        data_ws.cell(row=scores_start_row + i, column=1, value=f"{name} ({cnt})")
+        data_ws.cell(row=scores_start_row + i, column=2, value=avg)
+    scores_last_row = scores_start_row + len(avg_scores)
+
+    # === Графики на главном листе ===
+    chart_row = 8
+
+    # 1) Линейный график: конверсия и всего звонков по дням
+    line_chart = LineChart()
+    line_chart.title = "Динамика звонков и конверсии по дням"
+    line_chart.style = 10
+    line_chart.y_axis.title = "Звонков"
+    line_chart.x_axis.title = "Дата"
+    cats = Reference(data_ws, min_col=1, min_row=2, max_row=trend_last_row)
+    data_total = Reference(data_ws, min_col=2, min_row=1, max_row=trend_last_row)
+    data_conv = Reference(data_ws, min_col=7, min_row=1, max_row=trend_last_row)
+    line_chart.add_data(data_total, titles_from_data=True)
+    line_chart.add_data(data_conv, titles_from_data=True)
+    line_chart.set_categories(cats)
+    line_chart.width = 24
+    line_chart.height = 10
+    ws.add_chart(line_chart, f"A{chart_row}")
+
+    # 2) Столбчатая диаграмма: звонки по группам/линиям сегодня
+    if group_bar_rows:
+        bar_chart = BarChart()
+        bar_chart.title = "Звонки по линиям сегодня"
+        bar_chart.style = 12
+        bar_chart.y_axis.title = "Звонков"
+        cats2 = Reference(data_ws, min_col=1, min_row=group_start_row + 1, max_row=group_last_row)
+        data2 = Reference(data_ws, min_col=2, min_row=group_start_row, max_row=group_last_row)
+        bar_chart.add_data(data2, titles_from_data=True)
+        bar_chart.set_categories(cats2)
+        bar_chart.width = 24
+        bar_chart.height = 10
+        ws.add_chart(bar_chart, f"J{chart_row}")
+
+    chart_row_2 = chart_row + 21
+
+    # 3) Круговая диаграмма: направление звонков сегодня
+    pie_chart = PieChart()
+    pie_chart.title = "Входящие / исходящие сегодня"
+    cats3 = Reference(data_ws, min_col=1, min_row=direction_start_row + 1, max_row=direction_last_row)
+    data3 = Reference(data_ws, min_col=2, min_row=direction_start_row, max_row=direction_last_row)
+    pie_chart.add_data(data3, titles_from_data=True)
+    pie_chart.set_categories(cats3)
+    pie_chart.dataLabels = DataLabelList()
+    pie_chart.dataLabels.showPercent = True
+    pie_chart.width = 12
+    pie_chart.height = 10
+    ws.add_chart(pie_chart, f"A{chart_row_2}")
+
+    # 4) Столбчатая диаграмма: средний балл оценки по линиям
+    if avg_scores:
+        score_chart = BarChart()
+        score_chart.type = "bar"  # горизонтальные столбцы — удобнее читать названия линий
+        score_chart.title = "Средний балл оценки по линиям (/43)"
+        score_chart.style = 11
+        cats4 = Reference(data_ws, min_col=1, min_row=scores_start_row + 1, max_row=scores_last_row)
+        data4 = Reference(data_ws, min_col=2, min_row=scores_start_row, max_row=scores_last_row)
+        score_chart.add_data(data4, titles_from_data=True)
+        score_chart.set_categories(cats4)
+        score_chart.width = 24
+        score_chart.height = 12
+        ws.add_chart(score_chart, f"J{chart_row_2}")
+
+    # === Ширины колонок на главном листе ===
+    for col_letter in ["A", "B", "C", "D", "E", "F", "G", "H"]:
+        ws.column_dimensions[col_letter].width = 14
 
     wb.save(file_path)
     return file_path

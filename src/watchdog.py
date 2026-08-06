@@ -11,7 +11,7 @@ from src.database import (
     get_all_call_events
 )
 from src.api_client import get_calls
-from src.excel_maker import update_master_report, update_daily_report, update_statistics_report, BASE_REPORTS_DIR
+from src.excel_maker import update_master_report, update_daily_report, update_statistics_report, create_dashboard, BASE_REPORTS_DIR
 from src.call import process_single_call
 from src.sync_manager import YandexFolderSyncer
 
@@ -101,6 +101,14 @@ def watchdog():
                         logger.info(f"| [STATS EXCEL] Статистика по внутренним номерам обновлена: {stats_path}")
                 except Exception as stats_err:
                     logger.error(f"❌ Сбой при создании файла статистики: {stats_err}", exc_info=True)
+
+                # 3.5 === ДАШБОРД (графики + ссылки на остальные отчёты) ===
+                try:
+                    dashboard_path = create_dashboard(all_events, calls_for_report)
+                    if dashboard_path:
+                        logger.info(f"| [DASHBOARD] Дашборд обновлён: {dashboard_path}")
+                except Exception as dash_err:
+                    logger.error(f"❌ Сбой при создании дашборда: {dash_err}", exc_info=True)
                 
                 # 4. === ФУЛЛ КОММИТ ПАПКИ REPORTS НА ДИСК (СИНКЛЕР) ===
                 try:

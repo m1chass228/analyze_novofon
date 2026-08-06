@@ -212,3 +212,16 @@ class YandexFolderSyncer:
                 logger.info(f"🚀 [SYNC] Статистика обновлена в облаке! Ссылка: {stats_public_url}")
         except Exception as e:
             logger.error(f"❌ Ошибка синхронизации файла статистики: {e}")
+
+        # 8. Загрузка дашборда (графики + ссылки на остальные отчёты)
+        logger.info("📋 [SYNC] Загрузка дашборда в облако...")
+        try:
+            dashboard_local_path = os.path.join(self.local_root, "dashboard.xlsx")
+            if os.path.exists(dashboard_local_path):
+                dashboard_remote_path = f"{self.remote_root}/dashboard.xlsx"
+                self.disk.upload(dashboard_local_path, dashboard_remote_path, overwrite=True)
+                self.disk.publish(dashboard_remote_path)
+                dashboard_public_url = self.disk.get_meta(dashboard_remote_path).public_url
+                logger.info(f"🚀 [SYNC] Дашборд обновлён в облаке! Ссылка: {dashboard_public_url}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка синхронизации дашборда: {e}")
