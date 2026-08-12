@@ -663,6 +663,7 @@ STATS_GROUPS = [
     {
         "title": "ВСЕГО",
         "numbers": {"101", "100", "107", "102", "110", "114", "109", "120", "121", "122", "106", "131", "130", "117"},
+        "match_all": True,  # считаем ВСЕ залогированные звонки, не требуя точного совпадения по номеру
         "time_range": None,
         "metrics": ["total", "in", "out", "booked", "lost", "minutes"],
     },
@@ -753,6 +754,7 @@ def _compute_group_values(events_for_date: list, group: dict) -> dict:
     """Считает метрики одной группы по событиям одной даты"""
     numbers = group["numbers"]
     time_range = group["time_range"]
+    match_all = group.get("match_all", False)
 
     total = incoming = outgoing = booked = lost = 0
     minutes_sum = 0.0
@@ -761,7 +763,7 @@ def _compute_group_values(events_for_date: list, group: dict) -> dict:
         padded = list(row) + [None] * (7 - len(row))
         _call_id, start_time, direction, internal_number, duration, is_lost, appointment_made = padded[:7]
 
-        if internal_number not in numbers:
+        if not match_all and internal_number not in numbers:
             continue
         try:
             dt = datetime.strptime(str(start_time).split(".")[0], "%Y-%m-%d %H:%M:%S")
@@ -985,7 +987,7 @@ def create_dashboard(all_events: list, success_calls: list, links: dict = None) 
     trend_rows = []  # (дата, всего, входящие, исходящие, потерянные, запись, конверсия%)
     for date_key in dates_window:
         events_for_date = events_by_date.get(date_key, [])
-        vals = _compute_group_values(events_for_date, {"numbers": all_numbers, "time_range": None})
+        vals = _compute_group_values(events_for_date, {"numbers": all_numbers, "time_range": None, "match_all": True})
         trend_rows.append((date_key, vals["total"], vals["in"], vals["out"], vals["lost"], vals["booked"], vals["conversion"]))
 
     total_calls_period = sum(r[1] for r in trend_rows)

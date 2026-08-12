@@ -40,6 +40,9 @@ UNKNOWN_VALUE = "Не определен"
 DEFAULT_EMPLOYEE_NAME_TO_NUMBER = {
     "татьяна изосимова": "106",
     "раупова индира": "109",
+    "индира раупова": "109",
+    "admin_trubka": "100",       # Бирюлево, второй админ (по данным выгрузки Новофона от 06.08)
+    "adminkolomenskoe": "130",   # Коломенское — уточнить у клиники, что это точно 130, а не 131
 }
 
 logger = setup_logger("analyzer")
@@ -211,23 +214,30 @@ def get_calls(hours_back: int = 24):
                         stats_number = re.sub(r'\D', '', str(emp.get("extension_phone_number")))
                         break
 
-            if not stats_number and raw_admin_name:
-                # Номер встречается либо в начале ("103 Povodok"), либо в конце
-                # ("Иванова Анастасия - 120") строки от Новофона
-                m = re.match(r'^(\d{2,4})\b', raw_admin_name) or re.search(r'\b(\d{2,4})\s*$', raw_admin_name)
-                if m:
-                    stats_number = m.group(1)
-
-            if not stats_number and raw_admin_name:
-                # Если цифр в названии линии нет вообще (напр. "Татьяна Изосимова",
-                # "AdminKolomenskoe", "Admin_trubka") — берём из ручной таблицы
-                # соответствий. Дополнить/поправить можно через cfg.EMPLOYEE_NAME_TO_NUMBER
-                # в config.py (ключи регистронезависимы).
-                name_key = re.sub(r'\s+', ' ', raw_admin_name).strip().lower()
+            if not stats_number and (raw_admin_name or employees_list):
+                # Пробуем ПО ОЧЕРЕДИ имена всех сотрудников, участвовавших в звонке —
+                # если первое имя не распознаётся, возможно распознается следующее
+                # (напр. "AdminMaryino120, Индира Раупова" — второе имя уже есть в таблице)
                 name_map = {**DEFAULT_EMPLOYEE_NAME_TO_NUMBER}
                 for k, v in (getattr(cfg, 'EMPLOYEE_NAME_TO_NUMBER', {}) or {}).items():
                     name_map[str(k).strip().lower()] = str(v)
-                stats_number = name_map.get(name_key, "")
+
+                candidate_names = [raw_admin_name] if raw_admin_name else []
+                for emp in employees_list:
+                    if isinstance(emp, dict) and emp.get("employee_full_name"):
+                        candidate_names.append(emp.get("employee_full_name").strip())
+
+                for name in candidate_names:
+                    if not name:
+                        continue
+                    m = re.match(r'^(\d{2,4})(?=\D|$)', name) or re.search(r'(\d{2,4})\s*$', name)
+                    if m:
+                        stats_number = m.group(1)
+                        break
+                    name_key = re.sub(r'\s+', ' ', name).strip().lower()
+                    if name_key in name_map:
+                        stats_number = name_map[name_key]
+                        break
 
             if not stats_number:
                 logger.debug(
