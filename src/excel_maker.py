@@ -439,11 +439,11 @@ def update_master_report(calls_data: list, public_urls_map: dict = None, *args, 
     wb.save(MASTER_REPORT_PATH)
     return MASTER_REPORT_PATH
 
-def update_daily_report(calls_data: list, public_urls_map: dict = None) -> str | None:
+def update_daily_report(calls_data: list, public_urls_map: dict = None, target_date: str = None) -> str | None:
     """
     Создает или обновляет посуточный отчет в папке reports/daily/.
-    Имя файла и вкладки: текущая дата (например, 2026-05-26.xlsx).
-    Включает в себя только звонки за текущие сутки с жесткой проверкой резюме.
+    Имя файла и вкладки: target_date (YYYY-MM-DD) или текущая дата, если не указана.
+    Включает в себя только звонки за указанный день с жесткой проверкой резюме.
     """
     if public_urls_map is None:
         public_urls_map = {}
@@ -451,8 +451,8 @@ def update_daily_report(calls_data: list, public_urls_map: dict = None) -> str |
     # Проверяем, что папки созданы
     init_report_structure()
 
-    # Формируем имя файла и вкладки строго по текущей дате
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # Формируем имя файла и вкладки: либо явно переданная дата, либо сегодня
+    today_str = target_date if target_date else datetime.now().strftime("%Y-%m-%d")
     file_path = os.path.join(DAILY_DIR, f"{today_str}.xlsx")
     sheet_title = today_str
 
