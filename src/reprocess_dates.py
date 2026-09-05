@@ -76,7 +76,17 @@ def reprocess(date_from_day: str, date_till_day: str):
     # Пересобираем все отчёты и синхронизируем с Диском
     calls_for_report = get_success_calls_for_master()
     update_master_report(calls_for_report)
-    update_daily_report(calls_for_report)
+
+    # Daily за КАЖДЫЙ день диапазона (не только за сегодня)
+    from datetime import datetime, timedelta
+    start_dt = datetime.strptime(date_from_day, "%Y-%m-%d")
+    end_dt = datetime.strptime(date_till_day, "%Y-%m-%d")  # exclusive
+    current = start_dt
+    while current < end_dt:
+        day_str = current.strftime("%Y-%m-%d")
+        logger.info(f"📅 [REPROCESS] Собираю daily за {day_str}...")
+        update_daily_report(calls_for_report, target_date=day_str)
+        current += timedelta(days=1)
 
     all_events = get_all_call_events()
     update_statistics_report(all_events)

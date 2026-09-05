@@ -185,20 +185,44 @@ class YandexFolderSyncer:
         except Exception as e:
             logger.error(f"❌ Ошибка синхронизации Мастер-отчета: {e}")
 
-        # 6. Пересборка и принудительная заливка Ежедневного отчета за СЕГОДНЯ
-        logger.info("📅 [SYNC] Пересборка и загрузка сегодняшнего ежедневного отчета в облако...")
+        # 6. Пересборка сегодняшнего daily + заливка только новых/изменённых daily
+        logger.info("📅 [SYNC] Пересборка сегодняшнего ежедневного отчета...")
         try:
-            daily_local_path = update_daily_report(calls_data, public_urls_map)
-            if daily_local_path and os.path.exists(daily_local_path):
-                today_filename = os.path.basename(daily_local_path) # Например, 2026-05-26.xlsx
-                daily_remote_path = f"{self.remote_root}/daily/{today_filename}"
-                
-                self.disk.upload(daily_local_path, daily_remote_path, overwrite=True)
-                self.disk.publish(daily_remote_path)
-                daily_public_url = self.disk.get_meta(daily_remote_path).public_url
-                logger.info(f"🚀 [SYNC] Ежедневный отчет {today_filename} обновлен в облаке! Ссылка: {daily_public_url}")
+            update_daily_report(calls_data, public_urls_map)  # всегда обновляем сегодняшний
         except Exception as e:
-            logger.error(f"❌ Ошибка синхронизации Ежедневного отчета: {e}")
+            logger.error(f"❌ Ошибка пересборки сегодняшнего daily: {e}")
+
+        logger.info("📅 [SYNC] Загрузка daily-отчетов в облако...")
+        try:
+            local_daily_dir = os.path.join(self.local_root, "daily")
+            if os.path.isdir(local_daily_dir):
+                # какие daily уже есть на Диске
+                remote_daily = set()
+                try:
+                    for item in self.disk.listdir(f"{self.remote_root}/daily"):
+                        if item.type == "file":
+                            remote_daily.add(item.name)
+                except Exception:
+                    pass
+
+                today_name = datetime.now().strftime("%Y-%m-%d") + ".xlsx"
+                for fname in os.listdir(local_daily_dir):
+                    if not fname.endswith(".xlsx"):
+                        continue
+                    # сегодняшний всегда перезаливаем, остальные — только если их ещё нет
+                    if fname != today_name and fname in remote_daily:
+                        continue
+
+                    local_path = os.path.join(local_daily_dir, fname)
+                    remote_path = f"{self.remote_root}/daily/{fname}"
+                    self.disk.upload(local_path, remote_path, overwrite=True)
+                    self.disk.publish(remote_path)
+                    public_url = self.disk.get_meta(remote_path).public_url
+                    logger.info(f"🚀 [SYNC] Daily {fname} обновлён в облаке! Ссылка: {public_url}")
+            else:
+                logger.warning("⚠ [SYNC] Папка reports/daily/ не найдена")
+        except Exception as e:
+            logger.error(f"❌ Ошибка синхронизации daily-отчетов: {e}")
 
         # 7. Загрузка единого накопительного файла статистики (лежит рядом с мастер-отчётом)
         logger.info("📊 [SYNC] Загрузка файла статистики по внутренним номерам в облако...")
