@@ -657,17 +657,31 @@ def analyze_audio_via_paid_api(c_id: str, talk_duration: int, audio_bytes: bytes
                     # Разбор ответа OpenRouter
                     try:
                         resp_json = response.json()
+
+                        # Если OpenRouter (или прокси-скрипт) вернул ошибку в теле ответа
+                        # с кодом 200 (напр. muteHttpExceptions в GAS скрывает реальный
+                        # статус) — не принимаем это как валидный анализ, а падаем в ретрай/ошибку
+                        if isinstance(resp_json, dict) and resp_json.get("error"):
+                            err_info = resp_json.get("error")
+                            logger.error(f"❌ [DIRECT_OPENROUTER] Ответ содержит ошибку в теле (код 200): {err_info}")
+                            return None
+
                         choices = resp_json.get("choices", [])
                         if choices:
                             content_text = choices[0].get("message", {}).get("content", "").strip()
                         else:
-                            content_text = response.text.strip()
+                            logger.error(f"❌ [DIRECT_OPENROUTER] В ответе нет choices и нет error — подозрительный ответ: {response.text[:300]}")
+                            return None
                     except Exception:
                         content_text = response.text.strip()
 
                     # Финальная очистка и валидация
                     try:
-                        json.loads(content_text)
+                        parsed_check = json.loads(content_text)
+                        # Дополнительная защита: если внутри content тоже пришла ошибка/пустышка
+                        if isinstance(parsed_check, dict) and parsed_check.get("error") and "total_score" not in parsed_check:
+                            logger.error(f"❌ [DIRECT_OPENROUTER] content оказался объектом ошибки: {parsed_check}")
+                            return None
                         return content_text
                     except Exception:
                         cleaned = content_text.replace("```json", "").replace("```", "").strip()
