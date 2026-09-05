@@ -110,12 +110,8 @@ def get_record(call_id: str, record_id: str, communication_id: str = None) -> by
     logger.warning(f"| [DOWNLOAD] ❌ All attempts failed for {call_id}")
     return None
 
-def get_calls(hours_back: int = 24):
-    """Получает список звонков с записями"""
-    now = datetime.now()
-    date_from = (now - timedelta(hours=hours_back)).strftime("%Y-%m-%d %H:%M:%S")
-    date_till = (now + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-
+def _fetch_calls_page(date_from: str, date_till: str, offset: int = 0, limit: int = 500):
+    """Запрашивает ОДНУ страницу звонков за диапазон дат (низкоуровневая функция с пагинацией)"""
     payload = {
         "jsonrpc": "2.0",
         "method": "get.calls_report",
@@ -124,8 +120,8 @@ def get_calls(hours_back: int = 24):
             "access_token": cfg.NOVOFON_TOKEN,
             "date_from": date_from,
             "date_till": date_till,
-            "limit": 500,
-            "offset": 0,
+            "limit": limit,
+            "offset": offset,
             "include_ongoing_calls": False,
             "fields": [
                 "id", "start_time", "finish_time", "direction", "source", "is_lost", 
@@ -139,35 +135,32 @@ def get_calls(hours_back: int = 24):
         }
     }
 
-    try:
-        logger.info(f"[API] Запрос звонков: {hours_back}ч назад | {date_from} — {date_till}")
-        
-        # Заворачиваем запрос списка звонков в ретраи
-        for attempt in Retrying(
-            stop=stop_after_attempt(3),
-            wait=wait_exponential_jitter(initial=2, max=7, jitter=1),
-            retry=retry_if_exception_type((RequestException, SSLError)),
-            reraise=True
-        ):
-            with attempt:
-                if attempt.retry_state.attempt_number > 1:
-                    logger.warning(f"⏳ [API RETRY] Повторный запрос списка звонков, попытка №{attempt.retry_state.attempt_number}")
-                resp = requests.post(cfg.NOVOFON_DATAAPI, json=payload, timeout=30)
-                resp.raise_for_status()
-        
-        full_response = resp.json()
-        result = full_response.get("result", {})
-        data = result.get("data", [])
-        
-        logger.info(f"[API] Получено {len(data)} сессий звонков из API")
+    for attempt in Retrying(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(initial=2, max=7, jitter=1),
+        retry=retry_if_exception_type((RequestException, SSLError)),
+        reraise=True
+    ):
+        with attempt:
+            if attempt.retry_state.attempt_number > 1:
+                logger.warning(f"⏳ [API RETRY] Повторный запрос списка звонков, попытка №{attempt.retry_state.attempt_number}")
+            resp = requests.post(cfg.NOVOFON_DATAAPI, json=payload, timeout=30)
+            resp.raise_for_status()
 
-        calls = []
-        skipped_no_record = 0
+    full_response = resp.json()
+    result = full_response.get("result", {})
+    return result.get("data", [])
 
-        if data and isinstance(data, list) and isinstance(data[0], dict):
-            logger.info(f"[DEBUG_RAW_CALL] Сырая структура звонка: {json.dumps(data[0], ensure_ascii=False)}")
 
-        for call in data:
+def _parse_calls_data(data: list) -> list:
+    """Разбирает сырые данные Новофона в список внутренних объектов calls (общая логика парсинга)"""
+    calls = []
+    skipped_no_record = 0
+
+    if data and isinstance(data, list) and isinstance(data[0], dict):
+        logger.info(f"[DEBUG_RAW_CALL] Сырая структура звонка: {json.dumps(data[0], ensure_ascii=False)}")
+
+    for call in data:
             if not isinstance(call, dict):
                 logger.warning(f"[API WARN] Элемент call пришел не в виде dict: {type(call)} -> {call}")
                 continue
@@ -284,9 +277,58 @@ def get_calls(hours_back: int = 24):
                     record_call["record_id"] = str(rec_id)
                 calls.append(record_call)
 
-        logger.info(f"[API] Итого сформировано {len(calls)} записей | Без записи: {skipped_no_record}")
-        return calls
+    logger.info(f"[API] Итого сформировано {len(calls)} записей | Без записи: {skipped_no_record}")
+    return calls
 
+
+def get_calls_range(date_from: str, date_till: str) -> list:
+    """
+    Получает ВСЕ звонки за произвольный диапазон дат (с пагинацией — Novofon отдаёт
+    максимум 500 за раз). Формат дат: "YYYY-MM-DD HH:MM:SS".
+    Используется для разовых задач типа переобработки прошлых дней.
+    """
+    try:
+        all_data = []
+        offset = 0
+        limit = 500
+        while True:
+            logger.info(f"[API] Запрос звонков (диапазон): {date_from} — {date_till} | offset={offset}")
+            page = _fetch_calls_page(date_from, date_till, offset=offset, limit=limit)
+            logger.info(f"[API] Получено {len(page)} сессий звонков из API (страница offset={offset})")
+            all_data.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+
+        return _parse_calls_data(all_data)
+    except Exception as e:
+        logger.error(f"[API ERROR] Ошибка получения звонков за диапазон {date_from} — {date_till}: {e}", exc_info=True)
+        return []
+
+
+def get_calls(hours_back: int = 24):
+    """Получает список звонков с записями за последние hours_back часов (с пагинацией)"""
+    now = datetime.now()
+    date_from = (now - timedelta(hours=hours_back)).strftime("%Y-%m-%d %H:%M:%S")
+    date_till = (now + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        logger.info(f"[API] Запрос звонков: {hours_back}ч назад | {date_from} — {date_till}")
+
+        all_data = []
+        offset = 0
+        limit = 500
+        while True:
+            page = _fetch_calls_page(date_from, date_till, offset=offset, limit=limit)
+            if offset == 0:
+                logger.info(f"[API] Получено {len(page)} сессий звонков из API")
+            all_data.extend(page)
+            if len(page) < limit:
+                break
+            offset += limit
+            logger.info(f"[API] Догружаем следующую страницу звонков (offset={offset})...")
+
+        return _parse_calls_data(all_data)
     except Exception as e:
         logger.error(f"[API] Failed to fetch calls после всех попыток ретрая: {e}", exc_info=True)
         return []

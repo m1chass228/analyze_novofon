@@ -84,104 +84,14 @@ def init_db():
             value TEXT
         )
     """)
-
-    # 3. Таблица "сырых" событий звонков — пишем ВСЕ звонки (включая потерянные,
-    # короткие, без записи), чтобы отдельный файл статистики по внутренним номерам
-    # (create_statistics_report) считался корректно, а не только по успешно
-    # проанализированным звонкам
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS call_events (
-            call_id             TEXT PRIMARY KEY,
-            start_time          TEXT,
-            direction           TEXT DEFAULT 'in',
-            internal_number     TEXT,
-            duration            INTEGER DEFAULT 0,
-            is_lost             INTEGER DEFAULT 0,
-            appointment_made    INTEGER DEFAULT 0
-        )
-    """)
-
+    
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_call_id ON processed_calls(call_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_phone ON processed_calls(phone)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_processed_at ON processed_calls(processed_at)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ce_start_time ON call_events(start_time)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_ce_internal_number ON call_events(internal_number)")
     
     conn.commit()
     conn.close()
     logger.info("[DB] Database initialized successfully.")
-
-
-def log_call_event(call_id, start_time, direction, internal_number, duration, is_lost=False):
-    """Логирует 'сырое' событие звонка (для статистики по внутренним номерам). Идемпотентно по call_id."""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR IGNORE INTO call_events
-            (call_id, start_time, direction, internal_number, duration, is_lost)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            str(call_id), str(start_time) if start_time else "",
-            str(direction) if direction else "in",
-            str(internal_number) if internal_number else "",
-            int(duration or 0), 1 if is_lost else 0
-        ))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"[DB] log_call_event failed for {call_id}: {e}")
-
-
-def mark_call_appointment(call_id, appointment_made: bool):
-    """Помечает событие звонка как завершившееся записью на приём (для метрики 'Запись'/'Конверсия')"""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE call_events SET appointment_made = ? WHERE call_id = ?",
-            (1 if appointment_made else 0, str(call_id))
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"[DB] mark_call_appointment failed for {call_id}: {e}")
-
-
-def get_call_events_for_date(date_str: str) -> list:
-    """Возвращает все 'сырые' события звонков за дату YYYY-MM-DD (включая потерянные/короткие)"""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT call_id, start_time, direction, internal_number, duration, is_lost, appointment_made
-            FROM call_events
-            WHERE start_time LIKE ?
-        """, (f"{date_str}%",))
-        rows = cursor.fetchall()
-        conn.close()
-        return rows
-    except Exception as e:
-        logger.error(f"[DB] get_call_events_for_date failed: {e}")
-        return []
-
-
-def get_all_call_events() -> list:
-    """Возвращает ВСЕ 'сырые' события звонков за всё время (для накопительного файла статистики)"""
-    try:
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT call_id, start_time, direction, internal_number, duration, is_lost, appointment_made
-            FROM call_events
-            ORDER BY start_time DESC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-        return rows
-    except Exception as e:
-        logger.error(f"[DB] get_all_call_events failed: {e}")
-        return []
 
 
 def is_call_processed(call_key: str) -> bool:
@@ -401,3 +311,48 @@ def get_all_calls_from_db_func() -> list:
     except Exception as e:
         logger.error(f"❌ [DB GETTER ERROR] get_all_calls_from_db_func: {e}")
         return []
+
+
+# =========================================================================
+# ОДНОРАЗОВЫЕ УТИЛИТЫ ДЛЯ ПЕРЕОБРАБОТКИ ПРОШЛЫХ ДНЕЙ (reprocess_dates.py)
+# =========================================================================
+
+def delete_processed_calls_range(date_from: str, date_till: str) -> int:
+    """Удаляет записи processed_calls за диапазон дат (по start_time), чтобы
+    is_call_processed() снова вернул False и звонки переобработались заново.
+    Возвращает количество удалённых строк."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM processed_calls WHERE start_time >= ? AND start_time < ?",
+            (date_from, date_till)
+        )
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logger.info(f"[DB] Удалено {deleted} строк из processed_calls за {date_from} — {date_till}")
+        return deleted
+    except Exception as e:
+        logger.error(f"[DB] delete_processed_calls_range failed: {e}")
+        return 0
+
+
+def delete_call_events_range(date_from: str, date_till: str) -> int:
+    """Удаляет 'сырые' события звонков (call_events) за диапазон дат, чтобы
+    статистика/дашборд пересчитались заново после переобработки."""
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM call_events WHERE start_time >= ? AND start_time < ?",
+            (date_from, date_till)
+        )
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logger.info(f"[DB] Удалено {deleted} строк из call_events за {date_from} — {date_till}")
+        return deleted
+    except Exception as e:
+        logger.error(f"[DB] delete_call_events_range failed: {e}")
+        return 0
